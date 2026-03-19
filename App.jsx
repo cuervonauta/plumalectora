@@ -624,7 +624,8 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
     const a=audioRef.current; if(!a) return;
     a.pause(); setIsPlaying(false); setCurrentT(0); setDuration(0);
     if(rangeRef.current)rangeRef.current.style.setProperty('--prog','0%');
-    if(chapterCache[chapterIdx]){a.src=chapterCache[chapterIdx];a.playbackRate=speed;a.load();}
+    // No llamar a.load() — resetea el elemento y puede cancelar play() posterior
+    if(chapterCache[chapterIdx]){a.src=chapterCache[chapterIdx];a.playbackRate=speed;}
     else a.src='';
   // eslint-disable-next-line react-hooks/exhaustive-deps
   },[chapterIdx]);
@@ -650,7 +651,6 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
     try{
       const blob=await generateAudio(chapter.text,voice,abortRef.current.signal);
       const url=URL.createObjectURL(blob);
-      if(silentUrl) URL.revokeObjectURL(silentUrl);
       setChapterCache(p=>({...p,[chapterIdx]:url}));
       setChapterStatus(p=>({...p,[chapterIdx]:'ready'}));
       // Solo cambiar src y reproducir — sin a.load() que cancela el play()
@@ -660,7 +660,11 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
       if(e.name==='AbortError') return;
       setChapterStatus(p=>({...p,[chapterIdx]:'error'}));
       toast(e.message||'Error al generar el audio.','error');
-    }finally{setIsGen(false);}
+    }finally{
+      setIsGen(false);
+      // Siempre liberar el blob silencioso, haya éxito o error
+      URL.revokeObjectURL(silentUrl);
+    }
   };
 
   const togglePlay=async()=>{
@@ -828,7 +832,7 @@ export default function App() {
   const {toasts, toast} = useToast();
 
   // ── Theme ──
-  const { pref: themePref, setPref: setThemePref, isDark } = useThemeFixed();
+  const { pref: themePref, setPref: setThemePref } = useThemeFixed();
 
   // ── Inject CSS once ──
   useEffect(()=>{
