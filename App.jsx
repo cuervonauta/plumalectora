@@ -179,6 +179,21 @@ const THEME_OPTIONS = [
 ];
 
 // ─── UTILITIES ────────────────────────────────────────────────────────────────
+/** Crea un Blob WAV silencioso (para desbloquear el audio dentro del gesto del usuario) */
+function silentWavBlob(durationSec=0.1, sr=8000) {
+  const numSamples=Math.floor(sr*durationSec);
+  const pcm=new Uint8Array(numSamples*2);
+  const buf=new ArrayBuffer(44+pcm.length); const v=new DataView(buf);
+  const ws=(o,s)=>{for(let i=0;i<s.length;i++)v.setUint8(o+i,s.charCodeAt(i));};
+  ws(0,'RIFF');v.setUint32(4,36+pcm.length,true);ws(8,'WAVE');ws(12,'fmt ');
+  v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,1,true);
+  v.setUint32(24,sr,true);v.setUint32(28,sr*2,true);
+  v.setUint16(32,2,true);v.setUint16(34,16,true);
+  ws(36,'data');v.setUint32(40,pcm.length,true);
+  new Uint8Array(buf).set(pcm,44);
+  return new Blob([buf],{type:'audio/wav'});
+}
+
 function pcmBase64ToWavBlob(b64, sr=24000, ch=1, bits=16) {
   const raw = atob(b64);
   const pcm = new Uint8Array(raw.length);
@@ -255,8 +270,9 @@ function parseTXT(file) {
 }
 async function parsePDF(file) {
   const pdfjsLib=await import('pdfjs-dist');
+  // Usa el worker empaquetado por Vite — evita errores de versión en CDN
   pdfjsLib.GlobalWorkerOptions.workerSrc=
-   new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).href;
+    new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).href;
   const ab=await file.arrayBuffer();
   const pdf=await withTimeout(pdfjsLib.getDocument({data:ab}).promise,PARSE_TIMEOUT,'PDF');
   let text='';
@@ -621,6 +637,13 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
       a.play().catch(()=>toast('Toca Play nuevamente para reproducir.','error'));
       return;
     }
+    // ── Desbloquear audio DENTRO del gesto del usuario (antes del await) ──
+    const a=audioRef.current;
+    const silentUrl=URL.createObjectURL(silentWavBlob());
+    a.src=silentUrl; a.load();
+    try{ await a.play(); a.pause(); }catch{}
+    URL.revokeObjectURL(silentUrl); a.src='';
+
     abortRef.current?.abort(); abortRef.current=new AbortController();
     setIsGen(true); setChapterStatus(p=>({...p,[chapterIdx]:'generating'}));
     try{
@@ -628,7 +651,7 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
       const url=URL.createObjectURL(blob);
       setChapterCache(p=>({...p,[chapterIdx]:url}));
       setChapterStatus(p=>({...p,[chapterIdx]:'ready'}));
-      const a=audioRef.current; a.src=url; a.playbackRate=speed; a.load();
+      a.src=url; a.playbackRate=speed; a.load();
       a.play().catch(()=>toast('Toca Play nuevamente.','error'));
     }catch(e){
       if(e.name==='AbortError') return;
