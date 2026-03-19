@@ -23,6 +23,9 @@ const MAX_CHARS = 5000;
 // Voces válidas (whitelist — evita que alguien abuse del endpoint)
 const VALID_VOICES = new Set(['Kore','Aoede','Fenrir','Orus','Puck']);
 
+// Aumenta el límite de Vercel a 60s (el plan Hobby por defecto corta a 10s)
+export const config = { maxDuration: 60 };
+
 export default async function handler(req, res) {
   // ── CORS ────────────────────────────────────────────────────────────────────
   const allowedOrigin = process.env.ALLOWED_ORIGIN || '*';
