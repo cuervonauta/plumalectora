@@ -632,12 +632,6 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
 
   const generateAndPlay=async()=>{
     if(!chapter) return;
-    if(chapterCache[chapterIdx]){
-      const a=audioRef.current;
-      if(!a.src){a.src=chapterCache[chapterIdx];a.playbackRate=speed;}
-      a.play().catch(()=>toast('Toca Play nuevamente para reproducir.','error'));
-      return;
-    }
     // ── Desbloquear audio DENTRO del gesto del usuario (antes del await) ──
     // Importante: NO llamar a.load() ni limpiar src — eso cancela el unlock.
     const a=audioRef.current;
@@ -670,8 +664,15 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
   const togglePlay=async()=>{
     const a=audioRef.current; if(!a) return;
     if(isPlaying){a.pause();return;}
-    if(a.src) a.play().catch(()=>toast('Toca Play nuevamente.','error'));
-    else await generateAndPlay();
+    // ⚠️ NO usar a.src para detectar si hay audio — en Chrome/Safari, a.src=''
+    // devuelve la URL de la página (truthy), causando play() sobre fuente inválida.
+    // Usar chapterCache como fuente de verdad.
+    if(chapterCache[chapterIdx]){
+      a.src=chapterCache[chapterIdx]; a.playbackRate=speed;
+      a.play().catch(()=>toast('Toca Play nuevamente para reproducir.','error'));
+    } else {
+      await generateAndPlay();
+    }
   };
 
   const skip=d=>{const a=audioRef.current;if(a?.src)a.currentTime=Math.max(0,Math.min(a.duration||0,a.currentTime+d));};
