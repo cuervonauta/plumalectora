@@ -168,7 +168,7 @@ const VOICES = [
   { id:'Puck',   label:'Puck',   gender:'Hombre', desc:'Vibrante y expresiva'},
 ];
 const SPEEDS          = [0.75, 1, 1.25, 1.5, 2];
-const WORDS_PER_CHUNK = 800;
+const WORDS_PER_CHUNK = 250;  // ~1.5 min de audio por chunk — respuesta rápida de la API
 const PARSE_TIMEOUT   = 60_000;
 const TTS_ENDPOINT    = '/api/tts';
 
@@ -320,8 +320,7 @@ async function generateAudio(text,voice,signal) {
   for(let attempt=0;attempt<MAX_ATTEMPTS;attempt++){
     if(signal?.aborted) throw new DOMException('Cancelado','AbortError');
     const tc=new AbortController();
-    // Timeout reducido a 25s — suficiente para Gemini, no hace esperar demasiado al usuario
-    const tid=setTimeout(()=>tc.abort(),25_000);
+    const tid=setTimeout(()=>tc.abort(),45_000);
     const sig=(signal&&typeof AbortSignal.any==='function')
       ? AbortSignal.any([signal,tc.signal]) : tc.signal;
     try {
