@@ -316,10 +316,12 @@ async function parseFile(file) {
 
 // ─── TTS SERVICE ─────────────────────────────────────────────────────────────
 async function generateAudio(text,voice,signal) {
-  for(let attempt=0;attempt<3;attempt++){
+  const MAX_ATTEMPTS=3;
+  for(let attempt=0;attempt<MAX_ATTEMPTS;attempt++){
     if(signal?.aborted) throw new DOMException('Cancelado','AbortError');
     const tc=new AbortController();
-    const tid=setTimeout(()=>tc.abort(),60_000);
+    // Timeout reducido a 25s — suficiente para Gemini, no hace esperar demasiado al usuario
+    const tid=setTimeout(()=>tc.abort(),25_000);
     const sig=(signal&&typeof AbortSignal.any==='function')
       ? AbortSignal.any([signal,tc.signal]) : tc.signal;
     try {
@@ -329,7 +331,11 @@ async function generateAudio(text,voice,signal) {
       });
       clearTimeout(tid);
       if(res.status===429){
-        await new Promise(r=>setTimeout(r,Math.pow(2,attempt)*1500+Math.random()*500));
+        // Si ya agotamos los reintentos, lanzar error explicito
+        if(attempt===MAX_ATTEMPTS-1)
+          throw new Error('Límite de solicitudes alcanzado. Intenta en unos minutos.');
+        const wait=Math.pow(2,attempt)*1000+Math.random()*500;
+        await new Promise(r=>setTimeout(r,wait));
         continue;
       }
       if(!res.ok){const err=await res.json().catch(()=>({}));throw new Error(mapError(res.status,err));}
@@ -337,8 +343,19 @@ async function generateAudio(text,voice,signal) {
       const b64=data.audio;
       if(!b64) throw new Error('El servidor no devolvió audio.');
       return pcmBase64ToWavBlob(b64);
-    } catch(e){clearTimeout(tid);if(e.name==='AbortError')throw e;if(attempt===2)throw e;}
+    } catch(e){
+      clearTimeout(tid);
+      if(e.name==='AbortError'){
+        // Distinguir timeout propio vs cancelación del usuario
+        if(tc.signal.aborted&&!signal?.aborted)
+          throw new Error('Tiempo de espera agotado. Intenta de nuevo.');
+        throw e;
+      }
+      if(attempt===MAX_ATTEMPTS-1) throw e;
+    }
   }
+  // Nunca debería llegar aquí, pero por si acaso:
+  throw new Error('No se pudo generar el audio. Intenta de nuevo.');
 }
 
 // ─── HOOKS ────────────────────────────────────────────────────────────────────
