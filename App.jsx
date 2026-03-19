@@ -633,25 +633,28 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
     if(!chapter) return;
     if(chapterCache[chapterIdx]){
       const a=audioRef.current;
-      if(!a.src){a.src=chapterCache[chapterIdx];a.playbackRate=speed;a.load();}
+      if(!a.src){a.src=chapterCache[chapterIdx];a.playbackRate=speed;}
       a.play().catch(()=>toast('Toca Play nuevamente para reproducir.','error'));
       return;
     }
     // ── Desbloquear audio DENTRO del gesto del usuario (antes del await) ──
+    // Importante: NO llamar a.load() ni limpiar src — eso cancela el unlock.
     const a=audioRef.current;
     const silentUrl=URL.createObjectURL(silentWavBlob());
-    a.src=silentUrl; a.load();
-    try{ await a.play(); a.pause(); }catch{}
-    URL.revokeObjectURL(silentUrl); a.src='';
+    a.src=silentUrl;
+    try{ const p=a.play(); if(p) await p; a.pause(); }catch{}
+    // Dejamos el elemento desbloqueado; el src se sobreescribe abajo.
 
     abortRef.current?.abort(); abortRef.current=new AbortController();
     setIsGen(true); setChapterStatus(p=>({...p,[chapterIdx]:'generating'}));
     try{
       const blob=await generateAudio(chapter.text,voice,abortRef.current.signal);
       const url=URL.createObjectURL(blob);
+      if(silentUrl) URL.revokeObjectURL(silentUrl);
       setChapterCache(p=>({...p,[chapterIdx]:url}));
       setChapterStatus(p=>({...p,[chapterIdx]:'ready'}));
-      a.src=url; a.playbackRate=speed; a.load();
+      // Solo cambiar src y reproducir — sin a.load() que cancela el play()
+      a.src=url; a.playbackRate=speed;
       a.play().catch(()=>toast('Toca Play nuevamente.','error'));
     }catch(e){
       if(e.name==='AbortError') return;
