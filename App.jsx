@@ -256,7 +256,7 @@ function parseTXT(file) {
 async function parsePDF(file) {
   const pdfjsLib=await import('pdfjs-dist');
   pdfjsLib.GlobalWorkerOptions.workerSrc=
-    `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
+   new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).href;
   const ab=await file.arrayBuffer();
   const pdf=await withTimeout(pdfjsLib.getDocument({data:ab}).promise,PARSE_TIMEOUT,'PDF');
   let text='';
