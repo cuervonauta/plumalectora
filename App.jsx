@@ -168,7 +168,7 @@ const VOICES = [
   { id:'Puck',   label:'Puck',   gender:'Hombre', desc:'Vibrante y expresiva'},
 ];
 const SPEEDS          = [0.75, 1, 1.25, 1.5, 2];
-const WORDS_PER_CHUNK = 500;  // ~3.5 min de audio por chunk
+const WORDS_PER_CHUNK = 800;  // máx por llamada TTS (~5000 chars)
 const PARSE_TIMEOUT   = 60_000;
 const TTS_ENDPOINT    = '/api/tts';
 
@@ -231,42 +231,92 @@ function chunkByWords(text,max=WORDS_PER_CHUNK) {
   return out;
 }
 function detectChapters(text) {
-  const lines=text.split('\n');
+  // Normalizar saltos de línea (Windows \r\n, Mac antiguo \r)
+  const lines=text.replace(/\r\n/g,'\n').replace(/\r/g,'\n').split('\n');
   const breaks=[];
+
   lines.forEach((line,i)=>{
     const l=line.trim();
-    if(!l||l.length>80) return; // vacía o demasiado larga para ser título
+    if(!l||l.length>100) return;
+
     const isHeading=(
-      // "Capítulo 1", "Chapter One", "Parte II", "Sección 3", "Prólogo", "Epílogo"
-      /^(cap[ií]tulo|chapter|parte|part|secci[oó]n|section|pr[oó]logo|prologue|ep[ií]logo|epilogue|introducci[oó]n|introduction|conclusi[oó]n|conclusion|ap[eé]ndice|appendix)\b.{0,60}$/i.test(l) ||
-      // Números romanos solos: "I", "II", "III", "IV", "V" ... "XX"
+      // "Capítulo 1", "Capítulo 1: El inicio", "Chapter One", "Parte II", "Sección 3"
+      // "Prólogo", "Epílogo", "Introducción", "Conclusión", "Apéndice"
+      /^(cap[ií]tulo|chapter|parte|part|secci[oó]n|section|pr[oó]logo|prologue|ep[ií]logo|epilogue|introducci[oó]n|introduction|conclusi[oó]n|conclusion|ap[eé]ndice|appendix)\b.*$/i.test(l) ||
+      // Número romano solo en la línea: "I", "II", "III" … "XXIX"
       /^[IVXLCDM]{1,6}\.?\s*$/i.test(l) ||
-      // Solo número: "1", "2", "12"
+      // Número solo: "1", "2" … "99"
       /^\d{1,3}\.?\s*$/.test(l) ||
-      // "Capítulo I - El inicio" / "1. El comienzo" / "Chapter 1: Dawn"
-      /^(\d{1,3}|[IVXLCDM]{1,6})[.\-:]\s*.{2,60}$/i.test(l) ||
-      // Línea en MAYÚSCULAS corta (títulos al estilo clásico): "EL COMIENZO"
-      (l.length>=3&&l.length<=60&&l===l.toUpperCase()&&/[A-ZÁÉÍÓÚÜÑ]{3}/.test(l)&&!/[.!?,;]$/.test(l))
+      // "1. El comienzo", "1 - Dawn", "I: La partida" (número + separador + título)
+      /^(\d{1,3}|[IVXLCDM]{1,6})[\s.\-:–—]+\S.{0,80}$/i.test(l) ||
+      // Línea toda en MAYÚSCULAS corta (estilo clásico): "EL COMIENZO", "PARTE UNO"
+      (l.length>=3&&l.length<=60&&l===l.toUpperCase()&&/[A-ZÁÉÍÓÚÜÑ]{3}/.test(l)&&!/[.!?,;:]$/.test(l))
     );
     if(isHeading) breaks.push(i);
   });
-  if(breaks.length<2) return null;
-  return breaks.map((start,idx)=>{
+
+  if(breaks.length<1) return null;
+
+  const chapters=[];
+  breaks.forEach((start,idx)=>{
     const end=breaks[idx+1]??lines.length;
-    const body=lines.slice(start+1,end).join('\n').trim();
-    if(body.split(/\s+/).length<50) return null;
-    return {title:lines[start].trim(),text:body};
-  }).filter(Boolean);
+
+    // Construir el título: línea del encabezado
+    let title=lines[start].trim();
+
+    // Si la línea siguiente no vacía es corta (≤8 palabras), es un subtítulo
+    let bodyStart=start+1;
+    let peek=start+1;
+    while(peek<end&&!lines[peek].trim()) peek++;
+    const nextLine=(lines[peek]||'').trim();
+    if(nextLine&&nextLine.length<=80&&nextLine.split(/\s+/).length<=8&&
+       !/^(cap[ií]tulo|chapter|\d|[IVXLCDM]{1,6})/i.test(nextLine)){
+      title=`${title}: ${nextLine}`;
+      bodyStart=peek+1;
+    }
+
+    const body=lines.slice(bodyStart,end).join('\n').trim();
+    const wc=body.split(/\s+/).filter(Boolean).length;
+    if(wc<20) return; // ignorar capítulos vacíos o muy cortos
+    chapters.push({title,text:body,wordCount:wc});
+  });
+
+  return chapters.length>=1?chapters:null;
 }
+
 function buildBook(rawText,filename) {
-  const text=rawText.trim(); const chapters=detectChapters(text);
-  if(chapters&&chapters.length>1)
-    return chapters.map((c,i)=>({id:i,title:c.title,text:c.text,wordCount:c.text.split(/\s+/).length}));
+  const text=rawText.trim();
+  const detected=detectChapters(text);
+
+  if(detected&&detected.length>=1){
+    // Capítulos detectados — sub-dividir los que superen el límite TTS
+    const result=[];
+    detected.forEach(ch=>{
+      if(ch.wordCount<=WORDS_PER_CHUNK){
+        result.push({id:result.length,title:ch.title,text:ch.text,wordCount:ch.wordCount});
+      } else {
+        // Capítulo largo: dividir en partes conservando el título
+        const parts=chunkByWords(ch.text);
+        parts.forEach((part,j)=>{
+          const wc=part.split(/\s+/).filter(Boolean).length;
+          result.push({
+            id:result.length,
+            title:parts.length===1?ch.title:`${ch.title} — parte ${j+1}`,
+            text:part,wordCount:wc,
+          });
+        });
+      }
+    });
+    return result;
+  }
+
+  // Sin capítulos detectados — dividir todo el libro en secciones
   const chunks=chunkByWords(text);
   return chunks.map((chunk,i)=>({
     id:i,
     title:chunks.length===1?(filename||'Texto completo'):`Sección ${i+1} de ${chunks.length}`,
-    text:chunk,wordCount:chunk.split(/\s+/).length,
+    text:chunk,
+    wordCount:chunk.split(/\s+/).filter(Boolean).length,
   }));
 }
 
