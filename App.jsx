@@ -168,7 +168,7 @@ const VOICES = [
   { id:'Puck',   label:'Puck',   gender:'Hombre', desc:'Vibrante y expresiva'},
 ];
 const SPEEDS          = [0.75, 1, 1.25, 1.5, 2];
-const WORDS_PER_CHUNK = 250;  // ~1.5 min de audio por chunk — respuesta rápida de la API
+const WORDS_PER_CHUNK = 500;  // ~3.5 min de audio por chunk
 const PARSE_TIMEOUT   = 60_000;
 const TTS_ENDPOINT    = '/api/tts';
 
@@ -231,9 +231,25 @@ function chunkByWords(text,max=WORDS_PER_CHUNK) {
   return out;
 }
 function detectChapters(text) {
-  const RX=/^(cap[ií]tulo|chapter|parte|part|section|secci[oó]n|prologue|epílogo|epilogue)\b.{0,60}$/im;
-  const lines=text.split('\n'); const breaks=[];
-  lines.forEach((l,i)=>{if(RX.test(l.trim())&&l.trim().length>2)breaks.push(i);});
+  const lines=text.split('\n');
+  const breaks=[];
+  lines.forEach((line,i)=>{
+    const l=line.trim();
+    if(!l||l.length>80) return; // vacía o demasiado larga para ser título
+    const isHeading=(
+      // "Capítulo 1", "Chapter One", "Parte II", "Sección 3", "Prólogo", "Epílogo"
+      /^(cap[ií]tulo|chapter|parte|part|secci[oó]n|section|pr[oó]logo|prologue|ep[ií]logo|epilogue|introducci[oó]n|introduction|conclusi[oó]n|conclusion|ap[eé]ndice|appendix)\b.{0,60}$/i.test(l) ||
+      // Números romanos solos: "I", "II", "III", "IV", "V" ... "XX"
+      /^[IVXLCDM]{1,6}\.?\s*$/i.test(l) ||
+      // Solo número: "1", "2", "12"
+      /^\d{1,3}\.?\s*$/.test(l) ||
+      // "Capítulo I - El inicio" / "1. El comienzo" / "Chapter 1: Dawn"
+      /^(\d{1,3}|[IVXLCDM]{1,6})[.\-:]\s*.{2,60}$/i.test(l) ||
+      // Línea en MAYÚSCULAS corta (títulos al estilo clásico): "EL COMIENZO"
+      (l.length>=3&&l.length<=60&&l===l.toUpperCase()&&/[A-ZÁÉÍÓÚÜÑ]{3}/.test(l)&&!/[.!?,;]$/.test(l))
+    );
+    if(isHeading) breaks.push(i);
+  });
   if(breaks.length<2) return null;
   return breaks.map((start,idx)=>{
     const end=breaks[idx+1]??lines.length;
@@ -612,6 +628,7 @@ function UploadScreen({onBook, toast, isParsing, setIsParsing}) {
 // ─── PLAYER SCREEN ────────────────────────────────────────────────────────────
 function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCache,chapterStatus,setChapterStatus,voice,toast}) {
   const audioRef=useRef(null); const abortRef=useRef(null); const rangeRef=useRef(null);
+  const prefetchAbortRef=useRef(null); // para cancelar prefetch si cambia el capítulo
   const [isPlaying, setIsPlaying]=useState(false);
   const [isGen,     setIsGen]    =useState(false);
   const [currentT,  setCurrentT] =useState(0);
@@ -623,6 +640,8 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
   const prog=duration>0?(currentT/duration)*100:0;
 
   useEffect(()=>{if(audioRef.current)audioRef.current.playbackRate=speed;},[speed]);
+  // Cancelar prefetch al desmontar
+  useEffect(()=>()=>{prefetchAbortRef.current?.abort();},[]);
 
   useEffect(()=>{
     const a=audioRef.current; if(!a) return;
@@ -666,6 +685,8 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
       // Solo cambiar src y reproducir — sin a.load() que cancela el play()
       a.src=url; a.playbackRate=speed;
       a.play().catch(()=>toast('Toca Play nuevamente.','error'));
+      // Prefetch del siguiente capítulo en background
+      startPrefetch(chapterIdx+1);
     }catch(e){
       if(e.name==='AbortError') return;
       setChapterStatus(p=>({...p,[chapterIdx]:'error'}));
@@ -692,7 +713,33 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
   };
 
   const skip=d=>{const a=audioRef.current;if(a?.src)a.currentTime=Math.max(0,Math.min(a.duration||0,a.currentTime+d));};
-  const changeChap=d=>{abortRef.current?.abort();setIsGen(false);setChapterIdx(i=>i+d);};
+  const changeChap=d=>{
+    prefetchAbortRef.current?.abort();
+    abortRef.current?.abort();
+    setIsGen(false);
+    setChapterIdx(i=>i+d);
+  };
+
+  // ── Prefetch silencioso del capítulo siguiente ──────────────────────────────
+  const startPrefetch=useCallback((nextIdx)=>{
+    if(!book?.chapters[nextIdx]) return;
+    if(chapterCache[nextIdx]) return; // ya está en caché
+    prefetchAbortRef.current?.abort();
+    prefetchAbortRef.current=new AbortController();
+    const sig=prefetchAbortRef.current.signal;
+    // Esperamos 3s para no competir con la reproducción actual
+    setTimeout(async()=>{
+      if(sig.aborted) return;
+      try{
+        const blob=await generateAudio(book.chapters[nextIdx].text,voice,sig);
+        if(sig.aborted) return;
+        const url=URL.createObjectURL(blob);
+        setChapterCache(p=>({...p,[nextIdx]:url}));
+        setChapterStatus(p=>({...p,[nextIdx]:'ready'}));
+      }catch{/* fallo silencioso — el usuario puede generarlo manualmente */}
+    },3000);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[book,voice]);
 
   if(!book) return (
     <div style={{flex:1,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',padding:24,gap:16}}>
