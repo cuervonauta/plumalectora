@@ -167,10 +167,19 @@ const VOICES = [
   { id:'Orus',   label:'Orus',   gender:'Hombre', desc:'Cálida y narrativa'  },
   { id:'Puck',   label:'Puck',   gender:'Hombre', desc:'Vibrante y expresiva'},
 ];
-const SPEEDS          = [0.5, 0.75, 1, 1.25, 1.5, 2];
-const WORDS_PER_CHUNK = 400;  // máx por llamada TTS — 400 palabras ≈ 2000 chars, genera rápido
-const PARSE_TIMEOUT   = 60_000;
-const TTS_ENDPOINT    = '/api/tts';
+const OPENAI_VOICES = [
+  { id:'nova',    label:'Nova',    gender:'Mujer',  desc:'Cálida y natural — recomendada para español' },
+  { id:'shimmer', label:'Shimmer', gender:'Mujer',  desc:'Expresiva y clara'                           },
+  { id:'alloy',   label:'Alloy',   gender:'Neutro', desc:'Equilibrada y profesional'                  },
+  { id:'echo',    label:'Echo',    gender:'Hombre', desc:'Suave y conversacional'                     },
+  { id:'onyx',    label:'Onyx',    gender:'Hombre', desc:'Profunda y autoritativa'                    },
+  { id:'fable',   label:'Fable',   gender:'Hombre', desc:'Expresiva y narrativa'                      },
+];
+const SPEEDS               = [0.5, 0.75, 1, 1.25, 1.5, 2];
+const WORDS_PER_CHUNK      = 400;
+const PARSE_TIMEOUT        = 60_000;
+const TTS_ENDPOINT         = '/api/tts';
+const TTS_OPENAI_ENDPOINT  = '/api/tts-openai';
 
 const THEME_OPTIONS = [
   { id:'system', label:'Sistema', emoji:'💻' },
@@ -192,6 +201,13 @@ function silentWavBlob(durationSec=0.1, sr=8000) {
   ws(36,'data');v.setUint32(40,pcm.length,true);
   new Uint8Array(buf).set(pcm,44);
   return new Blob([buf],{type:'audio/wav'});
+}
+
+// Convierte base64 de cualquier formato (mp3, wav, etc.) a Blob
+function base64ToBlob(b64, mimeType='audio/mpeg') {
+  const raw=atob(b64); const bytes=new Uint8Array(raw.length);
+  for(let i=0;i<raw.length;i++) bytes[i]=raw.charCodeAt(i);
+  return new Blob([bytes],{type:mimeType});
 }
 
 function pcmBase64ToWavBlob(b64, sr=24000, ch=1, bits=16) {
@@ -380,10 +396,74 @@ async function parseFile(file) {
   return {title,chapters,totalWords,estimatedMins:estimateMins(totalWords)};
 }
 
+// ─── BROWSER TTS HELPERS ─────────────────────────────────────────────────────
+
+/**
+ * Divide el texto en oraciones con su posición exacta en el texto original.
+ * Las pausas entre oraciones (150 ms) y párrafos (500 ms) dan el ritmo
+ * natural que hace que la voz suene menos robótica.
+ */
+function buildSentences(text) {
+  const result = [];
+  const breakRe = /\n{2,}/g;
+  const breaks = []; let bm;
+  while ((bm = breakRe.exec(text)) !== null)
+    breaks.push({ start: bm.index, end: bm.index + bm[0].length });
+
+  const paraRanges = [];
+  let cur = 0;
+  for (const b of breaks) { paraRanges.push({ s: cur, e: b.start }); cur = b.end; }
+  paraRanges.push({ s: cur, e: text.length });
+
+  for (let pi = 0; pi < paraRanges.length; pi++) {
+    const { s: ps, e: pe } = paraRanges[pi];
+    const para = text.slice(ps, pe);
+    if (!para.trim()) continue;
+
+    const sents = []; let ss = 0;
+    for (let i = 0; i < para.length; i++) {
+      if ('.!?;'.includes(para[i])) {
+        const nx = i + 1;
+        if (nx >= para.length || /[\s\n]/.test(para[nx])) {
+          const s = para.slice(ss, nx).trim();
+          if (s && s.split(/\s+/).length >= 2)
+            sents.push({ text: s, charStart: ps + ss });
+          let sk = nx;
+          while (sk < para.length && /\s/.test(para[sk])) sk++;
+          ss = sk; i = sk - 1;
+        }
+      }
+    }
+    if (ss < para.length) {
+      const s = para.slice(ss).trim();
+      if (s) sents.push({ text: s, charStart: ps + ss });
+    }
+    if (sents.length === 0 && para.trim())
+      sents.push({ text: para.trim(), charStart: ps });
+
+    const lastPara = pi === paraRanges.length - 1;
+    sents.forEach((s, si) =>
+      result.push({ ...s, pauseAfter: si < sents.length - 1 ? 150 : (lastPara ? 0 : 500) })
+    );
+  }
+  return result.length > 0 ? result : [{ text: text.trim(), charStart: 0, pauseAfter: 0 }];
+}
+
+/** Puntúa una voz para elegir la más natural: Enhanced/Premium > local > español. */
+function scoreTTSVoice(v) {
+  let s = 0;
+  const lang = v.lang.toLowerCase(), name = v.name.toLowerCase();
+  if (lang.startsWith('es')) s += 10;
+  if (/enhanced|premium|neural|natural|online/.test(name)) s += 8;
+  if (v.localService) s += 6;
+  if (lang === 'es' || lang.startsWith('es-')) s += 2;
+  return s;
+}
+
 // ─── TTS SERVICE ─────────────────────────────────────────────────────────────
-async function generateAudio(text,voice,signal) {
+// endpoint: TTS_ENDPOINT (Gemini) o TTS_OPENAI_ENDPOINT (OpenAI)
+async function generateAudio(text,voice,signal,endpoint=TTS_ENDPOINT) {
   const MAX_ATTEMPTS=4;
-  // Backoff agresivo para respetar el límite de la API: 5s, 15s, 45s
   const BACKOFF=[5_000, 15_000, 45_000];
   for(let attempt=0;attempt<MAX_ATTEMPTS;attempt++){
     if(signal?.aborted) throw new DOMException('Cancelado','AbortError');
@@ -392,7 +472,7 @@ async function generateAudio(text,voice,signal) {
     const sig=(signal&&typeof AbortSignal.any==='function')
       ? AbortSignal.any([signal,tc.signal]) : tc.signal;
     try {
-      const res=await fetch(TTS_ENDPOINT,{
+      const res=await fetch(endpoint,{
         method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({text,voice}),signal:sig,
       });
@@ -408,6 +488,8 @@ async function generateAudio(text,voice,signal) {
       const data=await res.json();
       const b64=data.audio;
       if(!b64) throw new Error('El servidor no devolvió audio.');
+      // OpenAI devuelve MP3; Gemini devuelve PCM raw
+      if(data.format==='mp3') return base64ToBlob(b64,'audio/mpeg');
       return pcmBase64ToWavBlob(b64);
     } catch(e){
       clearTimeout(tid);
@@ -534,7 +616,7 @@ function ToastContainer({toasts}) {
 }
 
 // ─── SETTINGS MODAL ───────────────────────────────────────────────────────────
-function SettingsModal({voice, setVoice, ttsEngine, setTtsEngine, browserVoice, setBrowserVoice, themePref, setThemePref, onClose}) {
+function SettingsModal({voice, setVoice, ttsEngine, setTtsEngine, browserVoice, setBrowserVoice, openaiVoice, setOpenaiVoice, themePref, setThemePref, onClose}) {
   const [availVoices, setAvailVoices] = useState([]);
   const [showAllVoices, setShowAllVoices] = useState(false);
 
@@ -598,8 +680,9 @@ function SettingsModal({voice, setVoice, ttsEngine, setTtsEngine, browserVoice, 
         </label>
         <div style={{display:'flex',flexDirection:'column',gap:8,marginBottom:28}}>
           {[
-            {id:'browser', emoji:'⚡', title:'Navegador', sub:'Instantáneo · sin límites · funciona offline'},
-            {id:'gemini',  emoji:'✨', title:'Gemini IA',  sub:'Voz natural · requiere API · puede tener límites'},
+            {id:'browser', emoji:'⚡', title:'Navegador',  sub:'Instantáneo · sin límites · funciona offline'},
+            {id:'openai',  emoji:'🎙️', title:'OpenAI TTS', sub:'Voz humana real · requiere OPENAI_API_KEY · ~$0.03/capítulo'},
+            {id:'gemini',  emoji:'✨', title:'Gemini IA',  sub:'Voz natural · requiere GEMINI_API_KEY · límites frecuentes'},
           ].map(e=>{
             const active=ttsEngine===e.id;
             return (
@@ -670,6 +753,31 @@ function SettingsModal({voice, setVoice, ttsEngine, setTtsEngine, browserVoice, 
           </button>
         )}
         {(showAllVoices||esVoices.length===displayVoices.length)&&<div style={{marginBottom:20}}/>}
+        </>}
+
+        {/* ── VOCES OPENAI ── */}
+        {ttsEngine==='openai'&&<>
+        <label style={{display:'block',fontSize:11,fontWeight:700,color:'var(--c-text2)',marginBottom:8,textTransform:'uppercase',letterSpacing:'.08em'}}>
+          Voz OpenAI
+        </label>
+        <p style={{fontSize:12,color:'var(--c-muted)',marginBottom:12}}>
+          Todas hablan español de forma natural. <b style={{color:'var(--c-text2)'}}>Nova</b> es la más recomendada.
+        </p>
+        <div style={{display:'flex',flexDirection:'column',gap:8,marginBottom:28}}>
+          {OPENAI_VOICES.map(v=>(
+            <button key={v.id} onClick={()=>setOpenaiVoice(v.id)} aria-pressed={openaiVoice===v.id}
+              style={{textAlign:'left',padding:'13px 15px',borderRadius:13,
+                border:`2px solid ${openaiVoice===v.id?'var(--c-accent)':'var(--c-border2)'}`,
+                background:openaiVoice===v.id?'var(--c-accent-bg)':'var(--c-surface2)',
+                cursor:'pointer',transition:'all .18s'}}>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                <span style={{fontWeight:700,color:'var(--c-text)',fontSize:15}}>{v.label}</span>
+                <span style={{fontSize:11,color:'var(--c-text2)',background:'var(--c-surface)',padding:'2px 8px',borderRadius:20}}>{v.gender}</span>
+              </div>
+              <p style={{fontSize:12,color:'var(--c-muted)',marginTop:3}}>{v.desc}</p>
+            </button>
+          ))}
+        </div>
         </>}
 
         {/* ── VOZ (solo Gemini) ── */}
@@ -773,7 +881,7 @@ function UploadScreen({onBook, toast, isParsing, setIsParsing}) {
 }
 
 // ─── PLAYER SCREEN ────────────────────────────────────────────────────────────
-function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCache,chapterStatus,setChapterStatus,voice,toast,ttsEngine,browserVoice}) {
+function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCache,chapterStatus,setChapterStatus,voice,toast,ttsEngine,browserVoice,openaiVoice}) {
   // ── Refs ────────────────────────────────────────────────────────────────────
   const audioRef          =useRef(null);
   const abortRef          =useRef(null);
@@ -785,7 +893,12 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
   const charIndexRef      =useRef(0);
   const browserVoicesRef  =useRef([]);
   const speedRef          =useRef(1);
-  const speakFromCharRef  =useRef(null); // para el efecto de cambio de velocidad
+  const speakFromCharRef  =useRef(null);  // para handleSpeedChange
+  const speakNextRef      =useRef(null);  // motor de oraciones
+  const sentencesRef      =useRef([]);    // oraciones del capítulo actual
+  const sentIdxRef        =useRef(0);     // oración en curso
+  const pausedBetween     =useRef(false); // pausa entre oraciones
+  const betweenTimer      =useRef(null);  // timer entre oraciones
 
   // ── State ───────────────────────────────────────────────────────────────────
   const [isPlaying,      setIsPlaying]      =useState(false);
@@ -835,10 +948,13 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
     return()=>window.speechSynthesis?.removeEventListener('voiceschanged',load);
   },[]);
 
-  // ── Browser TTS: cancelar al cambiar capítulo ───────────────────────────────
+  // ── Browser TTS: cancelar todo al cambiar capítulo ──────────────────────────
   useEffect(()=>{
     if(ttsEngine==='browser'){
+      clearTimeout(betweenTimer.current);
       window.speechSynthesis?.cancel();
+      pausedBetween.current=false;
+      sentencesRef.current=[]; sentIdxRef.current=0;
       setIsPlaying(false); setBrowserProg(0); charIndexRef.current=0;
     }
   },[chapterIdx,ttsEngine]);
@@ -846,13 +962,20 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
   // ── Mantener speedRef sincronizado ──────────────────────────────────────────
   useEffect(()=>{ speedRef.current=speed; },[speed]);
 
-  // ── Cambio de velocidad: manejador directo (browser) / playbackRate (Gemini) ─
+  // ── Cambio de velocidad en tiempo real ──────────────────────────────────────
   const handleSpeedChange=(s)=>{
-    setSpeed(s);
-    if(ttsEngine==='gemini'&&audioRef.current) { audioRef.current.playbackRate=s; return; }
-    if(ttsEngine==='browser'&&window.speechSynthesis?.speaking){
-      speedRef.current=s; // actualizar ref ANTES de reiniciar
-      speakFromCharRef.current?.(charIndexRef.current);
+    setSpeed(s); speedRef.current=s;
+    if(ttsEngine==='gemini'&&audioRef.current){ audioRef.current.playbackRate=s; return; }
+    if(ttsEngine==='browser'){
+      const ss=window.speechSynthesis;
+      if(ss?.speaking||ss?.paused){
+        // Cancelar oración actual y reiniciar desde la misma con nueva velocidad
+        clearTimeout(betweenTimer.current);
+        pausedBetween.current=false;
+        ss.cancel(); // dispara onerror:'interrupted' (silenciado) en la utterance actual
+        // Pequeño delay para que cancel() se propague antes de iniciar la siguiente
+        setTimeout(()=>speakNextRef.current?.(),50);
+      }
     }
   };
 
@@ -869,48 +992,51 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
     return()=>clearTimeout(t);
   },[rateLimitSecs]);
 
-  // ── Browser TTS: hablar desde un carácter dado ──────────────────────────────
-  const speakFromChar=(fromChar=0)=>{
-    if(!chapter) return;
-    const fullText=chapter.text;
-    const textToSpeak=fromChar>0?fullText.slice(fromChar):fullText;
-    charIndexRef.current=fromChar;
-
-    window.speechSynthesis?.cancel();
-    const utt=new SpeechSynthesisUtterance(textToSpeak);
-    // 0.85× → "1×" suena pausado y natural; 0.5× mín para no distorsionar
-    utt.rate =Math.max(0.5, Math.min(2, speedRef.current * 0.85));
-    utt.pitch=0.92;   // ligeramente más grave → menos robótico
+  // ── Browser TTS: helper para crear una utterance con la mejor voz ──────────
+  const makeUtt=(text)=>{
+    const utt=new SpeechSynthesisUtterance(text);
+    utt.rate =Math.max(0.5,Math.min(2,speedRef.current*0.85)); // 1× → 0.85 real
+    utt.pitch=0.92;  // ligeramente más grave, menos robótico
     utt.lang ='es';
-
-    // Elegir la mejor voz disponible con sistema de puntuación:
-    // +10 en español, +8 enhanced/premium/neural (en iOS suenan casi humanas),
-    // +6 voz local (evita depender de red), +2 si contiene "es-" exacto
     const voices=browserVoicesRef.current;
-    const score=v=>{
-      let s=0;
-      const lang=v.lang.toLowerCase(); const name=v.name.toLowerCase();
-      if(lang.startsWith('es')) s+=10;
-      if(/enhanced|premium|neural|natural|online/.test(name)) s+=8;
-      if(v.localService) s+=6;
-      if(lang==='es'||lang.startsWith('es-')) s+=2;
-      return s;
-    };
     const chosen=browserVoice?voices.find(v=>v.voiceURI===browserVoice):null;
-    const bestAuto=[...voices].sort((a,b)=>score(b)-score(a))[0];
-    const bestVoice=chosen||bestAuto;
-    if(bestVoice) utt.voice=bestVoice;
+    const best=[...voices].sort((a,b)=>scoreTTSVoice(b)-scoreTTSVoice(a))[0];
+    if(chosen||best) utt.voice=chosen||best;
+    return utt;
+  };
+
+  // ── Browser TTS: hablar la oración actual y encadenar la siguiente ──────────
+  const speakNext=()=>{
+    if(pausedBetween.current) return;
+    const sents=sentencesRef.current;
+    const idx=sentIdxRef.current;
+    const fullLen=chapter?.text.length||1;
+
+    if(idx>=sents.length){
+      // Fin del capítulo → avanzar automáticamente
+      setIsPlaying(false); setBrowserProg(100);
+      setChapterIdx(i=>{ const max=(book?.chapters.length||1)-1; return i<max?i+1:i; });
+      return;
+    }
+
+    const {text,charStart,pauseAfter}=sents[idx];
+    const utt=makeUtt(text);
 
     utt.onstart=()=>setIsPlaying(true);
-    utt.onend=()=>{
-      setIsPlaying(false); setBrowserProg(100);
-      // Auto-avanzar al siguiente capítulo
-      setChapterIdx(i=>{ const max=(book?.chapters.length||1)-1; return i<max?i+1:i; });
-    };
     utt.onboundary=e=>{
       if(e.name==='word'){
-        const abs=fromChar+e.charIndex; charIndexRef.current=abs;
-        setBrowserProg(fullText.length>0?(abs/fullText.length)*100:0);
+        const abs=charStart+e.charIndex; charIndexRef.current=abs;
+        setBrowserProg((abs/fullLen)*100);
+      }
+    };
+    utt.onend=()=>{
+      sentIdxRef.current++;
+      charIndexRef.current=charStart+text.length;
+      setBrowserProg(((charStart+text.length)/fullLen)*100);
+      if(pauseAfter>0){
+        betweenTimer.current=setTimeout(()=>speakNextRef.current?.(),pauseAfter);
+      } else {
+        speakNextRef.current?.();
       }
     };
     utt.onerror=e=>{
@@ -918,10 +1044,30 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
     };
 
     utteranceRef.current=utt;
-    setBrowserProg(fullText.length>0?(fromChar/fullText.length)*100:0);
     window.speechSynthesis?.speak(utt);
   };
-  // Mantener ref para el efecto de cambio de velocidad
+  speakNextRef.current=speakNext; // siempre actualizar la ref
+
+  // ── Browser TTS: iniciar/saltar desde una posición de carácter ─────────────
+  const speakFromChar=(fromChar=0)=>{
+    if(!chapter) return;
+    clearTimeout(betweenTimer.current);
+    window.speechSynthesis?.cancel();
+    pausedBetween.current=false;
+
+    const sents=buildSentences(chapter.text);
+    sentencesRef.current=sents;
+
+    // Encontrar la oración que contiene fromChar
+    let startIdx=0;
+    for(let i=0;i<sents.length;i++){
+      if(sents[i].charStart<=fromChar) startIdx=i; else break;
+    }
+    sentIdxRef.current=startIdx;
+    charIndexRef.current=sents[startIdx]?.charStart??fromChar;
+    setBrowserProg(chapter.text.length>0?(charIndexRef.current/chapter.text.length)*100:0);
+    speakNextRef.current?.();
+  };
   speakFromCharRef.current=speakFromChar;
 
   const generateAndPlay=async()=>{
@@ -935,7 +1081,9 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
     abortRef.current?.abort(); abortRef.current=new AbortController();
     setIsGen(true); setChapterStatus(p=>({...p,[chapterIdx]:'generating'}));
     try{
-      const blob=await generateAudio(chapter.text,voice,abortRef.current.signal);
+      const ttsVoice   = ttsEngine==='openai'?openaiVoice:voice;
+      const ttsEndpoint= ttsEngine==='openai'?TTS_OPENAI_ENDPOINT:TTS_ENDPOINT;
+      const blob=await generateAudio(chapter.text,ttsVoice,abortRef.current.signal,ttsEndpoint);
       const url=URL.createObjectURL(blob);
       setChapterCache(p=>({...p,[chapterIdx]:url}));
       setChapterStatus(p=>({...p,[chapterIdx]:'ready'}));
@@ -962,8 +1110,28 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
   const togglePlay=async()=>{
     // ── Browser TTS ──────────────────────────────────────────────────────────
     if(ttsEngine==='browser'){
-      if(isPlaying){ window.speechSynthesis?.pause(); setIsPlaying(false); return; }
-      if(window.speechSynthesis?.paused){ window.speechSynthesis.resume(); setIsPlaying(true); return; }
+      if(isPlaying){
+        // Pausar: detener utterance actual + cancelar timer entre oraciones
+        clearTimeout(betweenTimer.current);
+        pausedBetween.current=true;
+        window.speechSynthesis?.pause();
+        setIsPlaying(false);
+        return;
+      }
+      if(window.speechSynthesis?.paused){
+        // Reanudar utterance pausada a mitad de oración
+        pausedBetween.current=false;
+        window.speechSynthesis.resume();
+        setIsPlaying(true);
+        return;
+      }
+      if(pausedBetween.current){
+        // Reanudar desde entre oraciones: continuar con la siguiente
+        pausedBetween.current=false;
+        speakNextRef.current?.();
+        return;
+      }
+      // Primera vez o después de saltar: iniciar desde posición actual
       speakFromChar(charIndexRef.current);
       return;
     }
@@ -992,7 +1160,11 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
     const a=audioRef.current;if(a?.src)a.currentTime=Math.max(0,Math.min(a.duration||0,a.currentTime+d));
   };
   const changeChap=d=>{
-    if(ttsEngine==='browser') window.speechSynthesis?.cancel();
+    if(ttsEngine==='browser'){
+      clearTimeout(betweenTimer.current);
+      window.speechSynthesis?.cancel();
+      pausedBetween.current=false;
+    }
     prefetchAbortRef.current?.abort();
     abortRef.current?.abort();
     setIsGen(false); setRateLimitSecs(0);
@@ -1010,7 +1182,9 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
     setTimeout(async()=>{
       if(sig.aborted) return;
       try{
-        const blob=await generateAudio(book.chapters[nextIdx].text,voice,sig);
+        const pfVoice   = ttsEngine==='openai'?openaiVoice:voice;
+        const pfEndpoint= ttsEngine==='openai'?TTS_OPENAI_ENDPOINT:TTS_ENDPOINT;
+        const blob=await generateAudio(book.chapters[nextIdx].text,pfVoice,sig,pfEndpoint);
         if(sig.aborted) return;
         const url=URL.createObjectURL(blob);
         setChapterCache(p=>({...p,[nextIdx]:url}));
@@ -1018,7 +1192,7 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
       }catch{/* fallo silencioso — el usuario puede generarlo manualmente */}
     },25_000);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[book,voice]);
+  },[book,voice,ttsEngine,openaiVoice]);
 
   if(!book) return (
     <div style={{flex:1,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',padding:24,gap:16}}>
@@ -1038,7 +1212,9 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
         <p style={{fontSize:10,fontWeight:800,color:'var(--c-accent)',textTransform:'uppercase',letterSpacing:'.12em',marginBottom:6}}>Reproduciendo</p>
         <h2 style={{fontSize:20,fontWeight:800,color:'var(--c-text)',lineHeight:1.3,marginBottom:4}}>{book.title}</h2>
         <p style={{color:'var(--c-muted)',fontSize:13}}>{chapter?.title} · {chapterIdx+1}/{total}</p>
-        <p style={{fontSize:10,color:'var(--c-muted2)',marginTop:2,opacity:.7}}>{ttsEngine==='browser'?'⚡ Navegador':'✨ Gemini IA'}</p>
+        <p style={{fontSize:10,color:'var(--c-muted2)',marginTop:2,opacity:.7}}>
+          {ttsEngine==='browser'?'⚡ Navegador':ttsEngine==='openai'?'🎙️ OpenAI TTS':'✨ Gemini IA'}
+        </p>
       </div>
 
       {/* Waveform */}
@@ -1201,8 +1377,9 @@ function ChaptersScreen({book,chapterIdx,setChapterIdx,chapterStatus,setActiveTa
 // ─── APP ROOT ─────────────────────────────────────────────────────────────────
 export default function App() {
   const [voice,         setVoice]         = useLS('ab_voice','Kore');
-  const [ttsEngine,     setTtsEngine]     = useLS('ab_engine','browser'); // 'browser' | 'gemini'
-  const [browserVoice,  setBrowserVoice]  = useLS('ab_bvoice','');       // voiceURI elegida por el user
+  const [ttsEngine,     setTtsEngine]     = useLS('ab_engine','browser'); // 'browser' | 'gemini' | 'openai'
+  const [browserVoice,  setBrowserVoice]  = useLS('ab_bvoice','');       // voiceURI del navegador
+  const [openaiVoice,   setOpenaiVoice]   = useLS('ab_ovoice','nova');    // voz de OpenAI
   const [showSettings,  setShowSettings]  = useState(false);
   const [activeTab,     setActiveTab]     = useState('upload');
   const [book,          setBook]          = useState(null);
@@ -1252,7 +1429,7 @@ export default function App() {
       {/* Screens */}
       <main style={{flex:1,display:'flex',flexDirection:'column',overflow:'hidden',animation:'fadeIn .2s ease'}}>
         {activeTab==='upload'   && <UploadScreen onBook={onBook} toast={toast} isParsing={isParsing} setIsParsing={setIsParsing}/>}
-        {activeTab==='player'   && <PlayerScreen book={book} chapterIdx={chapterIdx} setChapterIdx={setChapterIdx} chapterCache={chapterCache} setChapterCache={setChapterCache} chapterStatus={chapterStatus} setChapterStatus={setChapterStatus} voice={voice} toast={toast} ttsEngine={ttsEngine} browserVoice={browserVoice}/>}
+        {activeTab==='player'   && <PlayerScreen book={book} chapterIdx={chapterIdx} setChapterIdx={setChapterIdx} chapterCache={chapterCache} setChapterCache={setChapterCache} chapterStatus={chapterStatus} setChapterStatus={setChapterStatus} voice={voice} toast={toast} ttsEngine={ttsEngine} browserVoice={browserVoice} openaiVoice={openaiVoice}/>}
         {activeTab==='chapters' && <ChaptersScreen book={book} chapterIdx={chapterIdx} setChapterIdx={setChapterIdx} chapterStatus={chapterStatus} setActiveTab={setActiveTab}/>}
       </main>
 
@@ -1278,6 +1455,7 @@ export default function App() {
           voice={voice} setVoice={setVoice}
           ttsEngine={ttsEngine} setTtsEngine={setTtsEngine}
           browserVoice={browserVoice} setBrowserVoice={setBrowserVoice}
+          openaiVoice={openaiVoice}   setOpenaiVoice={setOpenaiVoice}
           themePref={themePref} setThemePref={setThemePref}
           onClose={()=>setShowSettings(false)}
         />
