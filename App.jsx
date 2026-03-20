@@ -167,7 +167,7 @@ const VOICES = [
   { id:'Orus',   label:'Orus',   gender:'Hombre', desc:'Cálida y narrativa'  },
   { id:'Puck',   label:'Puck',   gender:'Hombre', desc:'Vibrante y expresiva'},
 ];
-const SPEEDS          = [0.75, 1, 1.25, 1.5, 2];
+const SPEEDS          = [0.5, 0.75, 1, 1.25, 1.5, 2];
 const WORDS_PER_CHUNK = 400;  // máx por llamada TTS — 400 palabras ≈ 2000 chars, genera rápido
 const PARSE_TIMEOUT   = 60_000;
 const TTS_ENDPOINT    = '/api/tts';
@@ -534,7 +534,23 @@ function ToastContainer({toasts}) {
 }
 
 // ─── SETTINGS MODAL ───────────────────────────────────────────────────────────
-function SettingsModal({voice, setVoice, ttsEngine, setTtsEngine, themePref, setThemePref, onClose}) {
+function SettingsModal({voice, setVoice, ttsEngine, setTtsEngine, browserVoice, setBrowserVoice, themePref, setThemePref, onClose}) {
+  const [availVoices, setAvailVoices] = useState([]);
+  const [showAllVoices, setShowAllVoices] = useState(false);
+
+  useEffect(()=>{
+    const load=()=>{
+      const vs=window.speechSynthesis?.getVoices()||[];
+      setAvailVoices(vs);
+    };
+    load();
+    window.speechSynthesis?.addEventListener('voiceschanged',load);
+    return()=>window.speechSynthesis?.removeEventListener('voiceschanged',load);
+  },[]);
+
+  const esVoices=availVoices.filter(v=>v.lang.toLowerCase().startsWith('es'));
+  const displayVoices=showAllVoices?availVoices:esVoices.length?esVoices:availVoices.slice(0,12);
+
   return (
     <div
       role="dialog" aria-modal="true" aria-label="Preferencias"
@@ -602,6 +618,53 @@ function SettingsModal({voice, setVoice, ttsEngine, setTtsEngine, themePref, set
             );
           })}
         </div>
+
+        {/* ── VOCES DEL NAVEGADOR ── */}
+        {ttsEngine==='browser'&&displayVoices.length>0&&<>
+        <label style={{display:'block',fontSize:11,fontWeight:700,color:'var(--c-text2)',marginBottom:8,textTransform:'uppercase',letterSpacing:'.08em'}}>
+          Voz del navegador
+        </label>
+        <p style={{fontSize:12,color:'var(--c-muted)',marginBottom:10}}>
+          Voces instaladas en tu dispositivo. Las marcadas como <b style={{color:'var(--c-text2)'}}>local</b> son las más naturales.
+        </p>
+        <div style={{display:'flex',flexDirection:'column',gap:6,maxHeight:220,overflowY:'auto',marginBottom:8,padding:'2px 0'}}>
+          {/* Opción automática */}
+          <button onClick={()=>setBrowserVoice('')} aria-pressed={browserVoice===''}
+            style={{textAlign:'left',padding:'10px 13px',borderRadius:11,
+              border:`2px solid ${browserVoice===''?'var(--c-accent)':'var(--c-border2)'}`,
+              background:browserVoice===''?'var(--c-accent-bg)':'var(--c-surface2)',
+              cursor:'pointer',transition:'all .15s'}}>
+            <div style={{display:'flex',alignItems:'center',gap:6}}>
+              <span style={{fontSize:14}}>🔀</span>
+              <span style={{fontWeight:700,color:'var(--c-text)',fontSize:13}}>Automática</span>
+              <span style={{fontSize:10,color:'var(--c-muted)',marginLeft:'auto'}}>mejor disponible</span>
+            </div>
+          </button>
+          {displayVoices.map(v=>{
+            const active=browserVoice===v.voiceURI;
+            return (
+              <button key={v.voiceURI} onClick={()=>setBrowserVoice(v.voiceURI)} aria-pressed={active}
+                style={{textAlign:'left',padding:'10px 13px',borderRadius:11,
+                  border:`2px solid ${active?'var(--c-accent)':'var(--c-border2)'}`,
+                  background:active?'var(--c-accent-bg)':'var(--c-surface2)',
+                  cursor:'pointer',transition:'all .15s'}}>
+                <div style={{display:'flex',alignItems:'center',gap:6,flexWrap:'wrap'}}>
+                  <span style={{fontWeight:600,color:'var(--c-text)',fontSize:13,flex:1,minWidth:0,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{v.name}</span>
+                  <span style={{fontSize:10,color:'var(--c-muted)',flexShrink:0}}>{v.lang}</span>
+                  {v.localService&&<span style={{fontSize:9,fontWeight:800,color:'#22c55e',background:'rgba(34,197,94,.15)',padding:'1px 6px',borderRadius:10}}>local</span>}
+                </div>
+              </button>
+            );
+          })}
+        </div>
+        {!showAllVoices&&availVoices.length>esVoices.length&&(
+          <button onClick={()=>setShowAllVoices(true)}
+            style={{width:'100%',padding:'7px',borderRadius:10,border:'1px dashed var(--c-border2)',background:'transparent',color:'var(--c-muted)',fontSize:12,cursor:'pointer',marginBottom:20}}>
+            Ver todas las voces ({availVoices.length})
+          </button>
+        )}
+        {(showAllVoices||esVoices.length===displayVoices.length)&&<div style={{marginBottom:20}}/>}
+        </>}
 
         {/* ── VOZ (solo Gemini) ── */}
         {ttsEngine==='gemini'&&<>
@@ -704,7 +767,7 @@ function UploadScreen({onBook, toast, isParsing, setIsParsing}) {
 }
 
 // ─── PLAYER SCREEN ────────────────────────────────────────────────────────────
-function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCache,chapterStatus,setChapterStatus,voice,toast,ttsEngine}) {
+function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCache,chapterStatus,setChapterStatus,voice,toast,ttsEngine,browserVoice}) {
   // ── Refs ────────────────────────────────────────────────────────────────────
   const audioRef          =useRef(null);
   const abortRef          =useRef(null);
@@ -716,6 +779,7 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
   const charIndexRef      =useRef(0);
   const browserVoicesRef  =useRef([]);
   const speedRef          =useRef(1);
+  const speakFromCharRef  =useRef(null); // para el efecto de cambio de velocidad
 
   // ── State ───────────────────────────────────────────────────────────────────
   const [isPlaying,      setIsPlaying]      =useState(false);
@@ -776,6 +840,15 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
   // ── Mantener speedRef sincronizado ──────────────────────────────────────────
   useEffect(()=>{ speedRef.current=speed; },[speed]);
 
+  // ── Cambio de velocidad en tiempo real (browser TTS) ────────────────────────
+  useEffect(()=>{
+    if(ttsEngine!=='browser') return;
+    if(!window.speechSynthesis?.speaking) return;
+    // Reiniciar desde la posición actual con la nueva velocidad
+    speakFromCharRef.current?.(charIndexRef.current);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[speed, ttsEngine]);
+
   // ── Cuenta regresiva 429 → auto-retry ────────────────────────────────────────
   useEffect(()=>{
     if(rateLimitSecs<=0) return;
@@ -798,14 +871,19 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
 
     window.speechSynthesis?.cancel();
     const utt=new SpeechSynthesisUtterance(textToSpeak);
-    utt.rate=speedRef.current;
+    // Multiplicar por 0.85 para que "1×" suene natural, no apresurado
+    utt.rate=Math.max(0.3, Math.min(2, speedRef.current * 0.85));
     utt.lang='es';
 
-    // Preferir voz local en español; si no hay, usar la que sea en español
+    // 1) Voz elegida por el usuario en Settings
+    // 2) Mejor voz local en español
+    // 3) Cualquier voz en español
     const voices=browserVoicesRef.current;
-    const esLocal=voices.find(v=>v.lang.startsWith('es')&&v.localService);
-    const esAny  =voices.find(v=>v.lang.startsWith('es'));
-    if(esLocal||esAny) utt.voice=esLocal||esAny;
+    const chosen  =browserVoice?voices.find(v=>v.voiceURI===browserVoice):null;
+    const esLocal =voices.find(v=>v.lang.startsWith('es')&&v.localService);
+    const esAny   =voices.find(v=>v.lang.startsWith('es'));
+    const bestVoice=chosen||esLocal||esAny;
+    if(bestVoice) utt.voice=bestVoice;
 
     utt.onstart=()=>setIsPlaying(true);
     utt.onend=()=>{
@@ -827,6 +905,8 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
     setBrowserProg(fullText.length>0?(fromChar/fullText.length)*100:0);
     window.speechSynthesis?.speak(utt);
   };
+  // Mantener ref para el efecto de cambio de velocidad
+  speakFromCharRef.current=speakFromChar;
 
   const generateAndPlay=async()=>{
     if(!chapter) return;
@@ -1106,6 +1186,7 @@ function ChaptersScreen({book,chapterIdx,setChapterIdx,chapterStatus,setActiveTa
 export default function App() {
   const [voice,         setVoice]         = useLS('ab_voice','Kore');
   const [ttsEngine,     setTtsEngine]     = useLS('ab_engine','browser'); // 'browser' | 'gemini'
+  const [browserVoice,  setBrowserVoice]  = useLS('ab_bvoice','');       // voiceURI elegida por el user
   const [showSettings,  setShowSettings]  = useState(false);
   const [activeTab,     setActiveTab]     = useState('upload');
   const [book,          setBook]          = useState(null);
@@ -1155,7 +1236,7 @@ export default function App() {
       {/* Screens */}
       <main style={{flex:1,display:'flex',flexDirection:'column',overflow:'hidden',animation:'fadeIn .2s ease'}}>
         {activeTab==='upload'   && <UploadScreen onBook={onBook} toast={toast} isParsing={isParsing} setIsParsing={setIsParsing}/>}
-        {activeTab==='player'   && <PlayerScreen book={book} chapterIdx={chapterIdx} setChapterIdx={setChapterIdx} chapterCache={chapterCache} setChapterCache={setChapterCache} chapterStatus={chapterStatus} setChapterStatus={setChapterStatus} voice={voice} toast={toast} ttsEngine={ttsEngine}/>}
+        {activeTab==='player'   && <PlayerScreen book={book} chapterIdx={chapterIdx} setChapterIdx={setChapterIdx} chapterCache={chapterCache} setChapterCache={setChapterCache} chapterStatus={chapterStatus} setChapterStatus={setChapterStatus} voice={voice} toast={toast} ttsEngine={ttsEngine} browserVoice={browserVoice}/>}
         {activeTab==='chapters' && <ChaptersScreen book={book} chapterIdx={chapterIdx} setChapterIdx={setChapterIdx} chapterStatus={chapterStatus} setActiveTab={setActiveTab}/>}
       </main>
 
@@ -1180,6 +1261,7 @@ export default function App() {
         <SettingsModal
           voice={voice} setVoice={setVoice}
           ttsEngine={ttsEngine} setTtsEngine={setTtsEngine}
+          browserVoice={browserVoice} setBrowserVoice={setBrowserVoice}
           themePref={themePref} setThemePref={setThemePref}
           onClose={()=>setShowSettings(false)}
         />
