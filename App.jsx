@@ -198,6 +198,61 @@ const THEME_OPTIONS = [
   { id:'dark',   label:'Oscuro',  emoji:'🌙' },
 ];
 
+// ─── INDEXEDDB — PERSISTENCIA DE SESIÓN ───────────────────────────────────────
+const DB_NAME    = 'plumalectora_db';
+const DB_VERSION = 1;
+const DB_STORE   = 'state';
+
+/** Abre (o crea) la base de datos IndexedDB. */
+function _openDB() {
+  return new Promise((res, rej) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = e => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains(DB_STORE))
+        db.createObjectStore(DB_STORE, { keyPath: 'id' });
+    };
+    req.onsuccess = e => res(e.target.result);
+    req.onerror   = e => rej(e.target.error);
+  });
+}
+
+/** Lee un registro por id. Devuelve null si no existe o si falla (iOS privado, etc.). */
+async function dbGet(id) {
+  try {
+    const db = await _openDB();
+    return await new Promise((res, rej) => {
+      const req = db.transaction(DB_STORE,'readonly').objectStore(DB_STORE).get(id);
+      req.onsuccess = () => res(req.result ?? null);
+      req.onerror   = () => rej(req.error);
+    });
+  } catch { return null; }
+}
+
+/** Escribe un registro. Fire-and-forget — nunca bloquea la UI. */
+async function dbPut(record) {
+  try {
+    const db = await _openDB();
+    await new Promise((res, rej) => {
+      const req = db.transaction(DB_STORE,'readwrite').objectStore(DB_STORE).put(record);
+      req.onsuccess = () => res();
+      req.onerror   = () => rej(req.error);
+    });
+  } catch { /* fallo silencioso — cuotas, modo privado, etc. */ }
+}
+
+/** Elimina un registro. */
+async function dbDelete(id) {
+  try {
+    const db = await _openDB();
+    await new Promise((res, rej) => {
+      const req = db.transaction(DB_STORE,'readwrite').objectStore(DB_STORE).delete(id);
+      req.onsuccess = () => res();
+      req.onerror   = () => rej(req.error);
+    });
+  } catch {}
+}
+
 // ─── UTILITIES ────────────────────────────────────────────────────────────────
 /** Crea un Blob WAV silencioso (para desbloquear el audio dentro del gesto del usuario) */
 function silentWavBlob(durationSec=0.1, sr=8000) {
@@ -401,7 +456,7 @@ async function parseFile(file) {
   else throw new Error(`.${ext} no soportado. Usa TXT, PDF, EPUB o DOCX.`);
   if(!text?.trim()||text.trim().length<100)
     throw new Error('El archivo parece estar vacío o sin texto legible.');
-  const title=file.name.replace(/\.[^/.]+$/,'');
+  const title=file.name.replace(/\.[^/.]+$/,'').replace(/[_\-]+/g,' ').trim();
   const chapters=buildBook(text,title);
   const totalWords=chapters.reduce((s,c)=>s+c.wordCount,0);
   return {title,chapters,totalWords,estimatedMins:estimateMins(totalWords)};
@@ -550,6 +605,43 @@ function useToast() {
     setTimeout(()=>setToasts(t=>t.filter(x=>x.id!==id)),5000);
   },[]);
   return {toasts,toast};
+}
+
+/**
+ * useSessionPersistence — Guarda y recupera la sesión de lectura en IndexedDB.
+ * Estructura guardada: { id, book, chapterIdx, charIndex, chapterProgress, savedAt }
+ * chapterProgress: { [idx]: charIndex } — progreso exacto por capítulo.
+ */
+function useSessionPersistence() {
+  const saveSession = useCallback((book, chapterIdx, charIndex, chapterProgress) => {
+    if (!book) return;
+    // Fire-and-forget: nunca esperamos el resultado para no bloquear la UI
+    dbPut({
+      id: 'session',
+      book,
+      chapterIdx:      chapterIdx  || 0,
+      charIndex:       charIndex   || 0,
+      chapterProgress: chapterProgress || {},
+      savedAt:         Date.now(),
+    });
+  }, []);
+
+  const loadSession  = useCallback(() => dbGet('session'),    []);
+  const clearSession = useCallback(() => dbDelete('session'), []);
+
+  return { saveSession, loadSession, clearSession };
+}
+
+/** Formatea milisegundos en texto relativo: "hace 2 días", "hace 5 min", etc. */
+function timeAgo(ms) {
+  const diff = Date.now() - ms;
+  const mins  = Math.floor(diff / 60_000);
+  const hours = Math.floor(diff / 3_600_000);
+  const days  = Math.floor(diff / 86_400_000);
+  if (mins  < 1)  return 'hace un momento';
+  if (mins  < 60) return `hace ${mins} min`;
+  if (hours < 24) return `hace ${hours}h`;
+  return `hace ${days} día${days > 1 ? 's' : ''}`;
 }
 
 /**
@@ -841,7 +933,7 @@ function SettingsModal({voice, setVoice, ttsEngine, setTtsEngine, browserVoice, 
 }
 
 // ─── UPLOAD SCREEN ────────────────────────────────────────────────────────────
-function UploadScreen({onBook, toast, isParsing, setIsParsing}) {
+function UploadScreen({onBook, toast, isParsing, setIsParsing, savedSession, onResume, onNewBook}) {
   const [drag,setDrag]=useState(false);
   const inputRef=useRef();
 
@@ -903,12 +995,33 @@ function UploadScreen({onBook, toast, isParsing, setIsParsing}) {
       <p style={{color:'var(--c-disabled)',fontSize:12,marginTop:20,textAlign:'center',maxWidth:280,lineHeight:1.6}}>
         Tu archivo se procesa localmente en tu dispositivo.
       </p>
+
+      {/* Tarjeta "Continuar leyendo" */}
+      {savedSession&&(
+        <div style={{marginTop:20,width:'100%',maxWidth:340,background:'var(--c-surface)',borderRadius:18,padding:18,border:'1.5px solid var(--c-accent)',animation:'slideUp .3s ease'}}>
+          <p style={{fontSize:10,fontWeight:800,color:'var(--c-accent)',textTransform:'uppercase',letterSpacing:'.1em',marginBottom:6}}>📖 Continuar leyendo</p>
+          <p style={{fontSize:15,fontWeight:700,color:'var(--c-text)',marginBottom:3,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{savedSession.book?.title}</p>
+          <p style={{fontSize:12,color:'var(--c-muted)',marginBottom:14}}>
+            Capítulo {(savedSession.chapterIdx||0)+1} · {timeAgo(savedSession.savedAt)}
+          </p>
+          <div style={{display:'flex',gap:8}}>
+            <button onClick={onResume}
+              style={{flex:1,padding:'10px',borderRadius:12,background:'var(--c-btn)',border:'none',color:'#fff',fontSize:13,fontWeight:700,cursor:'pointer',boxShadow:'0 2px 10px var(--c-btn-glow)'}}>
+              ▶ Retomar
+            </button>
+            <button onClick={onNewBook}
+              style={{flex:1,padding:'10px',borderRadius:12,background:'transparent',border:'1.5px solid var(--c-border2)',color:'var(--c-text2)',fontSize:13,fontWeight:600,cursor:'pointer'}}>
+              Otro libro
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
 // ─── PLAYER SCREEN ────────────────────────────────────────────────────────────
-function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCache,chapterStatus,setChapterStatus,voice,toast,ttsEngine,browserVoice,openaiVoice,translationLang,setTranslationLang,translationCache,setTranslationCache}) {
+function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCache,chapterStatus,setChapterStatus,voice,toast,ttsEngine,browserVoice,openaiVoice,translationLang,setTranslationLang,translationCache,setTranslationCache,initialCharIndex,onProgressUpdate}) {
   // ── Refs ────────────────────────────────────────────────────────────────────
   const audioRef          =useRef(null);
   const abortRef          =useRef(null);
@@ -926,9 +1039,10 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
   const sentIdxRef        =useRef(0);     // oración en curso
   const pausedBetween     =useRef(false); // pausa entre oraciones
   const betweenTimer      =useRef(null);  // timer entre oraciones
-  const autoPlayRef       =useRef(false); // true → auto-play cuando avanza chapterIdx
-  const translationCacheRef=useRef({});  // espejo síncrono (evita stale closures en callbacks)
-  const effectiveTextRef  =useRef('');   // texto activo (original o traducido) para speakNext
+  const autoPlayRef        =useRef(false); // true → auto-play cuando avanza chapterIdx
+  const translationCacheRef=useRef({});   // espejo síncrono (evita stale closures en callbacks)
+  const effectiveTextRef   =useRef('');   // texto activo (original o traducido) para speakNext
+  const initialCharApplied =useRef(false);// true → ya aplicamos initialCharIndex (solo 1 vez)
 
   // ── State ───────────────────────────────────────────────────────────────────
   const [isPlaying,      setIsPlaying]      =useState(false);
@@ -939,6 +1053,7 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
   const [rateLimitSecs,  setRateLimitSecs]  =useState(0);
   const [browserProg,    setBrowserProg]    =useState(0); // 0–100 para browser TTS
   const [isTranslating,  setIsTranslating]  =useState(false);
+  const [bookFinished,   setBookFinished]   =useState(false);
 
   const chapter=book?.chapters[chapterIdx];
   // Mantener refs de traducción sincronizadas en cada render
@@ -963,9 +1078,12 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
     const onPlay=()=>setIsPlaying(true); const onPause=()=>setIsPlaying(false);
     const onEnded=()=>{
       setIsPlaying(false);
+      onProgressUpdate?.({ idx:chapterIdx, charIndex:0, saveNow:true });
       if(book&&chapterIdx<book.chapters.length-1){
         autoPlayRef.current=true;
         setChapterIdx(i=>i+1);
+      } else {
+        setBookFinished(true);
       }
     };
     a.addEventListener('timeupdate',onTime); a.addEventListener('loadedmetadata',onMeta);
@@ -1000,6 +1118,7 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
       sentencesRef.current=[]; sentIdxRef.current=0;
       setIsPlaying(false); setBrowserProg(0); charIndexRef.current=0;
     }
+    setBookFinished(false); // resetear al cambiar de capítulo
   },[chapterIdx,ttsEngine]);
 
   // ── Auto-play: reproducir el nuevo capítulo automáticamente al avanzar ───────
@@ -1016,6 +1135,29 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
     return()=>clearTimeout(t);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   },[chapterIdx,ttsEngine]);
+
+  // ── Restaurar posición exacta al reanudar sesión (solo 1 vez) ───────────────
+  useEffect(()=>{
+    if(initialCharApplied.current) return;
+    if(!initialCharIndex || initialCharIndex<=0) return;
+    if(!chapter) return;
+    initialCharApplied.current=true;
+    charIndexRef.current=initialCharIndex;
+    const textLen=effectiveTextRef.current.length||chapter.text.length||1;
+    setBrowserProg((initialCharIndex/textLen)*100);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[chapter, initialCharIndex]);
+
+  // ── Guardar progreso antes de cerrar la pestaña ──────────────────────────────
+  useEffect(()=>{
+    const onUnload=()=>{
+      if(!book) return;
+      onProgressUpdate?.({ idx:chapterIdx, charIndex:charIndexRef.current, saveNow:true });
+    };
+    window.addEventListener('beforeunload',onUnload);
+    return()=>window.removeEventListener('beforeunload',onUnload);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[book, chapterIdx]);
 
   // ── Mantener speedRef sincronizado ──────────────────────────────────────────
   useEffect(()=>{ speedRef.current=speed; },[speed]);
@@ -1073,10 +1215,16 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
     const fullLen=effectiveTextRef.current.length||1;
 
     if(idx>=sents.length){
-      // Fin del capítulo → avanzar automáticamente al siguiente
+      // Fin del capítulo
       setIsPlaying(false); setBrowserProg(100);
+      onProgressUpdate?.({ idx:chapterIdx, charIndex:effectiveTextRef.current.length, saveNow:true });
       const isLastChap=!book||chapterIdx>=(book.chapters.length-1);
-      if(!isLastChap){ autoPlayRef.current=true; setChapterIdx(i=>i+1); }
+      if(isLastChap){
+        setBookFinished(true);
+      } else {
+        autoPlayRef.current=true;
+        setChapterIdx(i=>i+1);
+      }
       return;
     }
 
@@ -1205,6 +1353,8 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
         pausedBetween.current=true;
         window.speechSynthesis?.pause();
         setIsPlaying(false);
+        // Guardar progreso exacto al pausar
+        onProgressUpdate?.({ idx:chapterIdx, charIndex:charIndexRef.current, saveNow:true });
         return;
       }
       if(window.speechSynthesis?.paused){
@@ -1242,9 +1392,13 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
       speakFromChar(charIndexRef.current);
       return;
     }
-    // ── Gemini TTS ───────────────────────────────────────────────────────────
+    // ── Gemini / OpenAI TTS ──────────────────────────────────────────────────
     const a=audioRef.current; if(!a) return;
-    if(isPlaying){a.pause();return;}
+    if(isPlaying){
+      a.pause();
+      onProgressUpdate?.({ idx:chapterIdx, charIndex:0, saveNow:true });
+      return;
+    }
     if(chapterCache[chapterIdx]){
       a.src=chapterCache[chapterIdx]; a.playbackRate=speed;
       a.play().catch(()=>toast('Toca Play nuevamente para reproducir.','error'));
@@ -1387,6 +1541,12 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
             <div style={{fontSize:28,fontWeight:900,color:'var(--c-accent)',marginBottom:6}}>{rateLimitSecs}s</div>
             <p style={{fontSize:12,color:'var(--c-muted)'}}>Límite de API — reintentando automáticamente…</p>
           </div>
+        ):bookFinished?(
+          <div style={{textAlign:'center',animation:'slideUp .4s ease'}}>
+            <div style={{fontSize:42,marginBottom:6}}>🎉</div>
+            <p style={{fontSize:14,fontWeight:800,color:'var(--c-text)',marginBottom:2}}>¡Libro completado!</p>
+            <p style={{fontSize:11,color:'var(--c-muted)'}}>Puedes cargar otro libro en la pestaña Cargar</p>
+          </div>
         ):(
           <div style={{textAlign:'center'}}>
             <div style={{fontSize:36,color:'var(--c-border2)',marginBottom:8}}><Ic.Headphones/></div>
@@ -1469,7 +1629,7 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
 }
 
 // ─── CHAPTERS SCREEN ──────────────────────────────────────────────────────────
-function ChaptersScreen({book,chapterIdx,setChapterIdx,chapterStatus,setActiveTab}) {
+function ChaptersScreen({book,chapterIdx,setChapterIdx,chapterStatus,setActiveTab,chapterProgress}) {
   if(!book) return (
     <div style={{flex:1,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',padding:24,gap:14}}>
       <div style={{fontSize:64,color:'var(--c-border2)'}}><Ic.List/></div>
@@ -1512,6 +1672,15 @@ function ChaptersScreen({book,chapterIdx,setChapterIdx,chapterStatus,setActiveTa
               <div style={{flex:1,minWidth:0}}>
                 <p style={{fontSize:13,fontWeight:active?800:500,color:active?'var(--c-accent-text)':'var(--c-text3)',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{ch.title}</p>
                 <p style={{fontSize:11,color:'var(--c-muted)',marginTop:2}}>~{estimateMins(ch.wordCount)} min · {ch.wordCount.toLocaleString()} palabras</p>
+                {/* Mini barra de progreso de lectura */}
+                {(chapterProgress?.[idx]>0||active)&&ch.text?.length>0&&(()=>{
+                  const pct=Math.min(100,Math.round(((chapterProgress?.[idx]||0)/ch.text.length)*100));
+                  return pct>0?(
+                    <div style={{marginTop:5,height:3,borderRadius:2,background:'var(--c-border2)',overflow:'hidden'}}>
+                      <div style={{height:'100%',borderRadius:2,width:`${pct}%`,background:active?'var(--c-accent)':'var(--c-muted)',transition:'width .4s ease'}}/>
+                    </div>
+                  ):null;
+                })()}
               </div>
               {active&&<span style={{fontSize:10,fontWeight:800,color:'var(--c-accent)',background:'var(--c-badge-bg)',padding:'2px 8px',borderRadius:20,flexShrink:0}}>Actual</span>}
             </button>
@@ -1525,21 +1694,26 @@ function ChaptersScreen({book,chapterIdx,setChapterIdx,chapterStatus,setActiveTa
 // ─── APP ROOT ─────────────────────────────────────────────────────────────────
 export default function App() {
   const [voice,           setVoice]           = useLS('ab_voice','Kore');
-  const [ttsEngine,       setTtsEngine]       = useLS('ab_engine','browser'); // 'browser' | 'gemini' | 'openai'
-  const [browserVoice,    setBrowserVoice]    = useLS('ab_bvoice','');       // voiceURI del navegador
-  const [openaiVoice,     setOpenaiVoice]     = useLS('ab_ovoice','nova');    // voz de OpenAI
-  const [translationLang, setTranslationLang] = useLS('ab_tlang','');        // '' | 'es-en' | 'en-es' | …
+  const [ttsEngine,       setTtsEngine]       = useLS('ab_engine','browser');
+  const [browserVoice,    setBrowserVoice]    = useLS('ab_bvoice','');
+  const [openaiVoice,     setOpenaiVoice]     = useLS('ab_ovoice','nova');
+  const [translationLang, setTranslationLang] = useLS('ab_tlang','');
   const [showSettings,    setShowSettings]    = useState(false);
   const [activeTab,       setActiveTab]       = useState('upload');
   const [book,            setBook]            = useState(null);
   const [chapterIdx,      setChapterIdx]      = useState(0);
   const [chapterCache,    setChapterCache]    = useState({});
   const [chapterStatus,   setChapterStatus]   = useState({});
-  const [translationCache,setTranslationCache]= useState({});              // {chapterIdx: translatedText}
+  const [translationCache,setTranslationCache]= useState({});
   const [isParsing,       setIsParsing]       = useState(false);
-  const {toasts, toast} = useToast();
+  // ── Persistencia de sesión ──
+  const [savedSession,    setSavedSession]    = useState(null);   // sesión cargada de IndexedDB
+  const [sessionLoaded,   setSessionLoaded]   = useState(false);  // ¿ya consultamos IndexedDB?
+  const [chapterProgress, setChapterProgress] = useState({});     // { [idx]: charIndex }
+  const [initialCharIndex,setInitialCharIndex]= useState(0);      // posición a restaurar
+  const { saveSession, loadSession, clearSession } = useSessionPersistence();
 
-  // ── Theme ──
+  const {toasts, toast} = useToast();
   const { pref: themePref, setPref: setThemePref } = useThemeFixed();
 
   // ── Inject CSS once ──
@@ -1550,11 +1724,49 @@ export default function App() {
     return()=>document.head.removeChild(tag);
   },[]);
 
+  // ── Cargar sesión guardada al iniciar ─────────────────────────────────────
+  useEffect(()=>{
+    loadSession().then(session=>{
+      if(session?.book) setSavedSession(session);
+      setSessionLoaded(true);
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[]);
+
+  // ── Reanudar sesión guardada ─────────────────────────────────────────────
+  const handleResume=useCallback(()=>{
+    if(!savedSession) return;
+    setBook(savedSession.book);
+    setChapterIdx(savedSession.chapterIdx||0);
+    setChapterProgress(savedSession.chapterProgress||{});
+    setInitialCharIndex(savedSession.charIndex||0);
+    setTranslationCache({});
+    setSavedSession(null);
+    setActiveTab('player');
+  },[savedSession]);
+
+  const handleNewBook=useCallback(()=>{
+    setSavedSession(null);
+    clearSession();
+  },[clearSession]);
+
+  // ── Cargar nuevo libro ────────────────────────────────────────────────────
   const onBook=useCallback(b=>{
     setBook(b); setChapterIdx(0); setChapterCache({}); setChapterStatus({});
-    setTranslationCache({});
+    setTranslationCache({}); setChapterProgress({}); setInitialCharIndex(0);
+    clearSession();
     setActiveTab('player');
-  },[]);
+  },[clearSession]);
+
+  // ── Guardar progreso (llamado desde PlayerScreen) ─────────────────────────
+  const onProgressUpdate=useCallback(({idx,charIndex,saveNow})=>{
+    setChapterProgress(prev=>{
+      const updated={...prev,[idx]:charIndex};
+      if(saveNow) saveSession(book,chapterIdx,charIndex,updated);
+      return updated;
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[book, chapterIdx, saveSession]);
 
   const TABS=[
     {id:'upload',   label:'Cargar',      Icon:Ic.Upload    },
@@ -1569,7 +1781,7 @@ export default function App() {
       <header style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'14px 20px',borderBottom:'1px solid var(--c-border)',flexShrink:0,background:'var(--c-bg)'}}>
         <div style={{display:'flex',alignItems:'center',gap:10}}>
           <span style={{color:'var(--c-accent)',fontSize:24}}><Ic.Headphones/></span>
-          <span style={{fontSize:18,fontWeight:800,color:'var(--c-text)',letterSpacing:'-.01em'}}>AudioBook Creator</span>
+          <span style={{fontSize:18,fontWeight:800,color:'var(--c-text)',letterSpacing:'-.01em'}}>Plumalectora</span>
         </div>
         <button onClick={()=>setShowSettings(true)} aria-label="Abrir preferencias"
           style={{background:'none',border:'none',color:'var(--c-muted)',fontSize:22,cursor:'pointer',padding:6,display:'flex',borderRadius:8,transition:'color .15s'}}>
@@ -1579,9 +1791,9 @@ export default function App() {
 
       {/* Screens */}
       <main style={{flex:1,display:'flex',flexDirection:'column',overflow:'hidden',animation:'fadeIn .2s ease'}}>
-        {activeTab==='upload'   && <UploadScreen onBook={onBook} toast={toast} isParsing={isParsing} setIsParsing={setIsParsing}/>}
-        {activeTab==='player'   && <PlayerScreen book={book} chapterIdx={chapterIdx} setChapterIdx={setChapterIdx} chapterCache={chapterCache} setChapterCache={setChapterCache} chapterStatus={chapterStatus} setChapterStatus={setChapterStatus} voice={voice} toast={toast} ttsEngine={ttsEngine} browserVoice={browserVoice} openaiVoice={openaiVoice} translationLang={translationLang} setTranslationLang={setTranslationLang} translationCache={translationCache} setTranslationCache={setTranslationCache}/>}
-        {activeTab==='chapters' && <ChaptersScreen book={book} chapterIdx={chapterIdx} setChapterIdx={setChapterIdx} chapterStatus={chapterStatus} setActiveTab={setActiveTab}/>}
+        {activeTab==='upload'   && <UploadScreen onBook={onBook} toast={toast} isParsing={isParsing} setIsParsing={setIsParsing} savedSession={sessionLoaded?savedSession:null} onResume={handleResume} onNewBook={handleNewBook}/>}
+        {activeTab==='player'   && <PlayerScreen book={book} chapterIdx={chapterIdx} setChapterIdx={setChapterIdx} chapterCache={chapterCache} setChapterCache={setChapterCache} chapterStatus={chapterStatus} setChapterStatus={setChapterStatus} voice={voice} toast={toast} ttsEngine={ttsEngine} browserVoice={browserVoice} openaiVoice={openaiVoice} translationLang={translationLang} setTranslationLang={setTranslationLang} translationCache={translationCache} setTranslationCache={setTranslationCache} initialCharIndex={initialCharIndex} onProgressUpdate={onProgressUpdate}/>}
+        {activeTab==='chapters' && <ChaptersScreen book={book} chapterIdx={chapterIdx} setChapterIdx={setChapterIdx} chapterStatus={chapterStatus} setActiveTab={setActiveTab} chapterProgress={chapterProgress}/>}
       </main>
 
       {/* Bottom Nav */}
