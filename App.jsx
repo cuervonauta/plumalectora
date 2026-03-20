@@ -180,6 +180,17 @@ const WORDS_PER_CHUNK      = 400;
 const PARSE_TIMEOUT        = 60_000;
 const TTS_ENDPOINT         = '/api/tts';
 const TTS_OPENAI_ENDPOINT  = '/api/tts-openai';
+const TRANSLATE_ENDPOINT   = '/api/translate';
+
+const TRANSLATION_LANGS = [
+  { value: '',      label: 'Sin traducción' },
+  { value: 'en-es', label: '🌐 English → Español',    from: 'en', to: 'es' },
+  { value: 'es-en', label: '🌐 Español → English',    from: 'es', to: 'en' },
+  { value: 'es-fr', label: '🌐 Español → Français',   from: 'es', to: 'fr' },
+  { value: 'en-fr', label: '🌐 English → Français',   from: 'en', to: 'fr' },
+  { value: 'es-pt', label: '🌐 Español → Português',  from: 'es', to: 'pt' },
+  { value: 'en-de', label: '🌐 English → Deutsch',    from: 'en', to: 'de' },
+];
 
 const THEME_OPTIONS = [
   { id:'system', label:'Sistema', emoji:'💻' },
@@ -449,14 +460,15 @@ function buildSentences(text) {
   return result.length > 0 ? result : [{ text: text.trim(), charStart: 0, pauseAfter: 0 }];
 }
 
-/** Puntúa una voz para elegir la más natural: Enhanced/Premium > local > español. */
-function scoreTTSVoice(v) {
+/** Puntúa una voz para elegir la más natural: Enhanced/Premium > local > idioma objetivo. */
+function scoreTTSVoice(v, targetLang = 'es') {
   let s = 0;
   const lang = v.lang.toLowerCase(), name = v.name.toLowerCase();
-  if (lang.startsWith('es')) s += 10;
+  const tl = targetLang.toLowerCase().split('-')[0]; // 'es-419' → 'es'
+  if (lang.startsWith(tl)) s += 10;
   if (/enhanced|premium|neural|natural|online/.test(name)) s += 8;
   if (v.localService) s += 6;
-  if (lang === 'es' || lang.startsWith('es-')) s += 2;
+  if (lang === tl || lang.startsWith(tl + '-')) s += 2;
   return s;
 }
 
@@ -502,6 +514,21 @@ async function generateAudio(text,voice,signal,endpoint=TTS_ENDPOINT) {
     }
   }
   throw new Error('No se pudo generar el audio. Intenta de nuevo.');
+}
+
+// ─── TRANSLATION SERVICE ──────────────────────────────────────────────────────
+async function translateText(text, from, to) {
+  const res = await fetch(TRANSLATE_ENDPOINT, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text, from, to }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(()=>({}));
+    throw new Error(err.error || `Error al traducir (${res.status}).`);
+  }
+  const data = await res.json();
+  if (!data.translated) throw new Error('No se recibió traducción.');
+  return data.translated;
 }
 
 // ─── HOOKS ────────────────────────────────────────────────────────────────────
@@ -881,7 +908,7 @@ function UploadScreen({onBook, toast, isParsing, setIsParsing}) {
 }
 
 // ─── PLAYER SCREEN ────────────────────────────────────────────────────────────
-function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCache,chapterStatus,setChapterStatus,voice,toast,ttsEngine,browserVoice,openaiVoice}) {
+function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCache,chapterStatus,setChapterStatus,voice,toast,ttsEngine,browserVoice,openaiVoice,translationLang,setTranslationLang,translationCache,setTranslationCache}) {
   // ── Refs ────────────────────────────────────────────────────────────────────
   const audioRef          =useRef(null);
   const abortRef          =useRef(null);
@@ -899,6 +926,9 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
   const sentIdxRef        =useRef(0);     // oración en curso
   const pausedBetween     =useRef(false); // pausa entre oraciones
   const betweenTimer      =useRef(null);  // timer entre oraciones
+  const autoPlayRef       =useRef(false); // true → auto-play cuando avanza chapterIdx
+  const translationCacheRef=useRef({});  // espejo síncrono (evita stale closures en callbacks)
+  const effectiveTextRef  =useRef('');   // texto activo (original o traducido) para speakNext
 
   // ── State ───────────────────────────────────────────────────────────────────
   const [isPlaying,      setIsPlaying]      =useState(false);
@@ -908,8 +938,15 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
   const [speed,          setSpeed]          =useState(1);
   const [rateLimitSecs,  setRateLimitSecs]  =useState(0);
   const [browserProg,    setBrowserProg]    =useState(0); // 0–100 para browser TTS
+  const [isTranslating,  setIsTranslating]  =useState(false);
 
   const chapter=book?.chapters[chapterIdx];
+  // Mantener refs de traducción sincronizadas en cada render
+  translationCacheRef.current=translationCache;
+  const effectiveText=(translationLang&&translationCache[chapterIdx])
+    ?translationCache[chapterIdx]
+    :(chapter?.text||'');
+  effectiveTextRef.current=effectiveText;
   // Browser TTS: siempre "listo" (no hay fase de generación)
   const isReady=ttsEngine==='browser'||!!chapterCache[chapterIdx];
   // Progreso: browser usa posición de carácter; Gemini usa tiempo de audio
@@ -924,7 +961,13 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
     const onTime=()=>{setCurrentT(a.currentTime);if(rangeRef.current&&a.duration)rangeRef.current.style.setProperty('--prog',`${(a.currentTime/a.duration)*100}%`);};
     const onMeta=()=>setDuration(a.duration);
     const onPlay=()=>setIsPlaying(true); const onPause=()=>setIsPlaying(false);
-    const onEnded=()=>{setIsPlaying(false);if(book&&chapterIdx<book.chapters.length-1)setChapterIdx(i=>i+1);};
+    const onEnded=()=>{
+      setIsPlaying(false);
+      if(book&&chapterIdx<book.chapters.length-1){
+        autoPlayRef.current=true;
+        setChapterIdx(i=>i+1);
+      }
+    };
     a.addEventListener('timeupdate',onTime); a.addEventListener('loadedmetadata',onMeta);
     a.addEventListener('play',onPlay);       a.addEventListener('pause',onPause);
     a.addEventListener('ended',onEnded);
@@ -957,6 +1000,21 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
       sentencesRef.current=[]; sentIdxRef.current=0;
       setIsPlaying(false); setBrowserProg(0); charIndexRef.current=0;
     }
+  },[chapterIdx,ttsEngine]);
+
+  // ── Auto-play: reproducir el nuevo capítulo automáticamente al avanzar ───────
+  useEffect(()=>{
+    if(!autoPlayRef.current) return;
+    autoPlayRef.current=false;
+    const t=setTimeout(()=>{
+      if(ttsEngine==='browser'){
+        speakFromCharRef.current?.(0);
+      } else {
+        genAndPlayRef.current?.();
+      }
+    },200); // pequeño delay para que los effects de limpieza terminen
+    return()=>clearTimeout(t);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   },[chapterIdx,ttsEngine]);
 
   // ── Mantener speedRef sincronizado ──────────────────────────────────────────
@@ -997,10 +1055,12 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
     const utt=new SpeechSynthesisUtterance(text);
     utt.rate =Math.max(0.5,Math.min(2,speedRef.current*0.85)); // 1× → 0.85 real
     utt.pitch=0.92;  // ligeramente más grave, menos robótico
-    utt.lang ='es';
+    const langPair=TRANSLATION_LANGS.find(l=>l.value===translationLang);
+    const targetLang=langPair?.to||'es';
+    utt.lang=targetLang;
     const voices=browserVoicesRef.current;
     const chosen=browserVoice?voices.find(v=>v.voiceURI===browserVoice):null;
-    const best=[...voices].sort((a,b)=>scoreTTSVoice(b)-scoreTTSVoice(a))[0];
+    const best=[...voices].sort((a,b)=>scoreTTSVoice(b,targetLang)-scoreTTSVoice(a,targetLang))[0];
     if(chosen||best) utt.voice=chosen||best;
     return utt;
   };
@@ -1010,12 +1070,13 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
     if(pausedBetween.current) return;
     const sents=sentencesRef.current;
     const idx=sentIdxRef.current;
-    const fullLen=chapter?.text.length||1;
+    const fullLen=effectiveTextRef.current.length||1;
 
     if(idx>=sents.length){
-      // Fin del capítulo → avanzar automáticamente
+      // Fin del capítulo → avanzar automáticamente al siguiente
       setIsPlaying(false); setBrowserProg(100);
-      setChapterIdx(i=>{ const max=(book?.chapters.length||1)-1; return i<max?i+1:i; });
+      const isLastChap=!book||chapterIdx>=(book.chapters.length-1);
+      if(!isLastChap){ autoPlayRef.current=true; setChapterIdx(i=>i+1); }
       return;
     }
 
@@ -1055,7 +1116,9 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
     window.speechSynthesis?.cancel();
     pausedBetween.current=false;
 
-    const sents=buildSentences(chapter.text);
+    // Usar texto traducido si está disponible, sino el original
+    const textToUse=effectiveTextRef.current||chapter.text;
+    const sents=buildSentences(textToUse);
     sentencesRef.current=sents;
 
     // Encontrar la oración que contiene fromChar
@@ -1065,7 +1128,7 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
     }
     sentIdxRef.current=startIdx;
     charIndexRef.current=sents[startIdx]?.charStart??fromChar;
-    setBrowserProg(chapter.text.length>0?(charIndexRef.current/chapter.text.length)*100:0);
+    setBrowserProg(textToUse.length>0?(charIndexRef.current/textToUse.length)*100:0);
     speakNextRef.current?.();
   };
   speakFromCharRef.current=speakFromChar;
@@ -1078,12 +1141,38 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
     a.src=silentUrl;
     try{ const p=a.play(); if(p) await p; a.pause(); }catch{}
 
+    // Traducir si hay idioma seleccionado y no está en caché
+    let textToGen=chapter.text;
+    if(translationLang){
+      const cached=translationCacheRef.current[chapterIdx];
+      if(cached){
+        textToGen=cached;
+      } else {
+        const langPair=TRANSLATION_LANGS.find(l=>l.value===translationLang);
+        if(langPair){
+          setIsTranslating(true);
+          try{
+            const translated=await translateText(chapter.text,langPair.from,langPair.to);
+            translationCacheRef.current={...translationCacheRef.current,[chapterIdx]:translated};
+            setTranslationCache(p=>({...p,[chapterIdx]:translated}));
+            textToGen=translated;
+          }catch(e){
+            toast(e.message||'Error al traducir.','error');
+            setIsTranslating(false);
+            URL.revokeObjectURL(silentUrl);
+            return;
+          }
+          setIsTranslating(false);
+        }
+      }
+    }
+
     abortRef.current?.abort(); abortRef.current=new AbortController();
     setIsGen(true); setChapterStatus(p=>({...p,[chapterIdx]:'generating'}));
     try{
       const ttsVoice   = ttsEngine==='openai'?openaiVoice:voice;
       const ttsEndpoint= ttsEngine==='openai'?TTS_OPENAI_ENDPOINT:TTS_ENDPOINT;
-      const blob=await generateAudio(chapter.text,ttsVoice,abortRef.current.signal,ttsEndpoint);
+      const blob=await generateAudio(textToGen,ttsVoice,abortRef.current.signal,ttsEndpoint);
       const url=URL.createObjectURL(blob);
       setChapterCache(p=>({...p,[chapterIdx]:url}));
       setChapterStatus(p=>({...p,[chapterIdx]:'ready'}));
@@ -1131,7 +1220,25 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
         speakNextRef.current?.();
         return;
       }
-      // Primera vez o después de saltar: iniciar desde posición actual
+      // Traducir si hay idioma seleccionado y no está en caché
+      if(translationLang&&!translationCacheRef.current[chapterIdx]){
+        const langPair=TRANSLATION_LANGS.find(l=>l.value===translationLang);
+        if(langPair&&chapter){
+          setIsTranslating(true);
+          try{
+            const translated=await translateText(chapter.text,langPair.from,langPair.to);
+            translationCacheRef.current={...translationCacheRef.current,[chapterIdx]:translated};
+            setTranslationCache(p=>({...p,[chapterIdx]:translated}));
+            effectiveTextRef.current=translated;
+          }catch(e){
+            toast(e.message||'Error al traducir.','error');
+            setIsTranslating(false);
+            return;
+          }
+          setIsTranslating(false);
+        }
+      }
+      // Iniciar/reanudar desde posición actual (0 si es inicio)
       speakFromChar(charIndexRef.current);
       return;
     }
@@ -1148,7 +1255,7 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
 
   const skip=d=>{
     if(ttsEngine==='browser'){
-      const text=chapter?.text||''; if(!text) return;
+      const text=effectiveTextRef.current||chapter?.text||''; if(!text) return;
       // ~150 palabras/min × ~5 chars/palabra ÷ 60s = ~12.5 chars/s a velocidad 1×
       const skipChars=Math.round(12.5*speedRef.current*d);
       const newPos=Math.max(0,Math.min(text.length-1,charIndexRef.current+skipChars));
@@ -1215,11 +1322,52 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
         <p style={{fontSize:10,color:'var(--c-muted2)',marginTop:2,opacity:.7}}>
           {ttsEngine==='browser'?'⚡ Navegador':ttsEngine==='openai'?'🎙️ OpenAI TTS':'✨ Gemini IA'}
         </p>
+
+        {/* Selector de idioma / traducción */}
+        <div style={{marginTop:10,display:'flex',alignItems:'center',justifyContent:'center',gap:6}}>
+          <select
+            value={translationLang}
+            onChange={e=>{
+              const newLang=e.target.value;
+              // Detener reproducción actual
+              if(ttsEngine==='browser'){
+                clearTimeout(betweenTimer.current);
+                window.speechSynthesis?.cancel();
+                pausedBetween.current=false;
+                setIsPlaying(false);
+              } else {
+                abortRef.current?.abort();
+                audioRef.current?.pause();
+                setIsPlaying(false); setIsGen(false);
+              }
+              // Limpiar caché de traducción y reset de posición
+              translationCacheRef.current={};
+              setTranslationCache({});
+              charIndexRef.current=0; setBrowserProg(0);
+              setTranslationLang(newLang);
+            }}
+            style={{
+              background:'var(--c-surface2)',color:'var(--c-text)',
+              border:`1.5px solid ${translationLang?'var(--c-accent)':'var(--c-border2)'}`,
+              borderRadius:10,padding:'5px 10px',fontSize:12,
+              cursor:'pointer',outline:'none',maxWidth:230,
+            }}
+          >
+            {TRANSLATION_LANGS.map(l=>(
+              <option key={l.value} value={l.value}>{l.label}</option>
+            ))}
+          </select>
+        </div>
       </div>
 
       {/* Waveform */}
       <div style={{background:'var(--c-surface)',borderRadius:20,height:100,display:'flex',alignItems:'center',justifyContent:'center',gap:3,padding:'0 16px',overflow:'hidden'}}>
-        {isGen?(
+        {isTranslating?(
+          <div style={{textAlign:'center'}}>
+            <div style={{fontSize:26,marginBottom:4}}>🌐</div>
+            <p style={{fontSize:12,color:'var(--c-muted)'}}>Traduciendo…</p>
+          </div>
+        ):isGen?(
           /* Generando con Gemini — barras animadas de carga */
           Array.from({length:22}).map((_,i)=>(
             <div key={i} style={{width:4,borderRadius:4,background:'var(--c-accent)',animation:`wave .9s ease-in-out infinite`,animationDelay:`${i*.075}s`,height:8}}/>
@@ -1256,7 +1404,7 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
             const pct=+e.target.value;
             e.target.style.setProperty('--prog',`${pct}%`);
             if(ttsEngine==='browser'){
-              const text=chapter?.text||'';
+              const text=effectiveTextRef.current||chapter?.text||'';
               if(!text) return;
               const charPos=Math.round((pct/100)*text.length);
               speakFromChar(charPos);
@@ -1376,17 +1524,19 @@ function ChaptersScreen({book,chapterIdx,setChapterIdx,chapterStatus,setActiveTa
 
 // ─── APP ROOT ─────────────────────────────────────────────────────────────────
 export default function App() {
-  const [voice,         setVoice]         = useLS('ab_voice','Kore');
-  const [ttsEngine,     setTtsEngine]     = useLS('ab_engine','browser'); // 'browser' | 'gemini' | 'openai'
-  const [browserVoice,  setBrowserVoice]  = useLS('ab_bvoice','');       // voiceURI del navegador
-  const [openaiVoice,   setOpenaiVoice]   = useLS('ab_ovoice','nova');    // voz de OpenAI
-  const [showSettings,  setShowSettings]  = useState(false);
-  const [activeTab,     setActiveTab]     = useState('upload');
-  const [book,          setBook]          = useState(null);
-  const [chapterIdx,    setChapterIdx]    = useState(0);
-  const [chapterCache,  setChapterCache]  = useState({});
-  const [chapterStatus, setChapterStatus] = useState({});
-  const [isParsing,     setIsParsing]     = useState(false);
+  const [voice,           setVoice]           = useLS('ab_voice','Kore');
+  const [ttsEngine,       setTtsEngine]       = useLS('ab_engine','browser'); // 'browser' | 'gemini' | 'openai'
+  const [browserVoice,    setBrowserVoice]    = useLS('ab_bvoice','');       // voiceURI del navegador
+  const [openaiVoice,     setOpenaiVoice]     = useLS('ab_ovoice','nova');    // voz de OpenAI
+  const [translationLang, setTranslationLang] = useLS('ab_tlang','');        // '' | 'es-en' | 'en-es' | …
+  const [showSettings,    setShowSettings]    = useState(false);
+  const [activeTab,       setActiveTab]       = useState('upload');
+  const [book,            setBook]            = useState(null);
+  const [chapterIdx,      setChapterIdx]      = useState(0);
+  const [chapterCache,    setChapterCache]    = useState({});
+  const [chapterStatus,   setChapterStatus]   = useState({});
+  const [translationCache,setTranslationCache]= useState({});              // {chapterIdx: translatedText}
+  const [isParsing,       setIsParsing]       = useState(false);
   const {toasts, toast} = useToast();
 
   // ── Theme ──
@@ -1402,6 +1552,7 @@ export default function App() {
 
   const onBook=useCallback(b=>{
     setBook(b); setChapterIdx(0); setChapterCache({}); setChapterStatus({});
+    setTranslationCache({});
     setActiveTab('player');
   },[]);
 
@@ -1429,7 +1580,7 @@ export default function App() {
       {/* Screens */}
       <main style={{flex:1,display:'flex',flexDirection:'column',overflow:'hidden',animation:'fadeIn .2s ease'}}>
         {activeTab==='upload'   && <UploadScreen onBook={onBook} toast={toast} isParsing={isParsing} setIsParsing={setIsParsing}/>}
-        {activeTab==='player'   && <PlayerScreen book={book} chapterIdx={chapterIdx} setChapterIdx={setChapterIdx} chapterCache={chapterCache} setChapterCache={setChapterCache} chapterStatus={chapterStatus} setChapterStatus={setChapterStatus} voice={voice} toast={toast} ttsEngine={ttsEngine} browserVoice={browserVoice} openaiVoice={openaiVoice}/>}
+        {activeTab==='player'   && <PlayerScreen book={book} chapterIdx={chapterIdx} setChapterIdx={setChapterIdx} chapterCache={chapterCache} setChapterCache={setChapterCache} chapterStatus={chapterStatus} setChapterStatus={setChapterStatus} voice={voice} toast={toast} ttsEngine={ttsEngine} browserVoice={browserVoice} openaiVoice={openaiVoice} translationLang={translationLang} setTranslationLang={setTranslationLang} translationCache={translationCache} setTranslationCache={setTranslationCache}/>}
         {activeTab==='chapters' && <ChaptersScreen book={book} chapterIdx={chapterIdx} setChapterIdx={setChapterIdx} chapterStatus={chapterStatus} setActiveTab={setActiveTab}/>}
       </main>
 
