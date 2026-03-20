@@ -1,6 +1,8 @@
 {
   "functions": {
-    "api/tts.js": { "maxDuration": 60 }
+    "api/tts.js":        { "maxDuration": 60 },
+    "api/tts-openai.js": { "maxDuration": 60 },
+    "api/translate.js":  { "maxDuration": 30 }
   },
   "rewrites": [
     { "source": "/api/(.*)", "destination": "/api/$1" },
