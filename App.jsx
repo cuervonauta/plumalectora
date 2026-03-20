@@ -640,18 +640,24 @@ function SettingsModal({voice, setVoice, ttsEngine, setTtsEngine, browserVoice, 
               <span style={{fontSize:10,color:'var(--c-muted)',marginLeft:'auto'}}>mejor disponible</span>
             </div>
           </button>
-          {displayVoices.map(v=>{
+          {[...displayVoices].sort((a,b)=>{
+            // Ordenar: español primero, luego enhanced/premium, luego local
+            const sc=v=>{let s=0;const l=v.lang.toLowerCase(),n=v.name.toLowerCase();if(l.startsWith('es'))s+=10;if(/enhanced|premium|neural|natural|online/.test(n))s+=8;if(v.localService)s+=6;return s;};
+            return sc(b)-sc(a);
+          }).map(v=>{
             const active=browserVoice===v.voiceURI;
+            const isHQ=/enhanced|premium|neural|natural/i.test(v.name);
             return (
               <button key={v.voiceURI} onClick={()=>setBrowserVoice(v.voiceURI)} aria-pressed={active}
                 style={{textAlign:'left',padding:'10px 13px',borderRadius:11,
-                  border:`2px solid ${active?'var(--c-accent)':'var(--c-border2)'}`,
+                  border:`2px solid ${active?'var(--c-accent)':isHQ?'rgba(251,191,36,.4)':'var(--c-border2)'}`,
                   background:active?'var(--c-accent-bg)':'var(--c-surface2)',
                   cursor:'pointer',transition:'all .15s'}}>
-                <div style={{display:'flex',alignItems:'center',gap:6,flexWrap:'wrap'}}>
+                <div style={{display:'flex',alignItems:'center',gap:5,flexWrap:'wrap'}}>
                   <span style={{fontWeight:600,color:'var(--c-text)',fontSize:13,flex:1,minWidth:0,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{v.name}</span>
                   <span style={{fontSize:10,color:'var(--c-muted)',flexShrink:0}}>{v.lang}</span>
-                  {v.localService&&<span style={{fontSize:9,fontWeight:800,color:'#22c55e',background:'rgba(34,197,94,.15)',padding:'1px 6px',borderRadius:10}}>local</span>}
+                  {isHQ&&<span style={{fontSize:9,fontWeight:800,color:'#f59e0b',background:'rgba(245,158,11,.15)',padding:'1px 6px',borderRadius:10}}>⭐ HD</span>}
+                  {v.localService&&!isHQ&&<span style={{fontSize:9,fontWeight:800,color:'#22c55e',background:'rgba(34,197,94,.15)',padding:'1px 6px',borderRadius:10}}>local</span>}
                 </div>
               </button>
             );
@@ -796,7 +802,7 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
   // Progreso: browser usa posición de carácter; Gemini usa tiempo de audio
   const prog=ttsEngine==='browser'?browserProg:(duration>0?(currentT/duration)*100:0);
 
-  useEffect(()=>{if(audioRef.current)audioRef.current.playbackRate=speed;},[speed]);
+  // playbackRate del elemento de audio se gestiona en handleSpeedChange
   // Cancelar prefetch al desmontar
   useEffect(()=>()=>{prefetchAbortRef.current?.abort();},[]);
 
@@ -840,14 +846,15 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
   // ── Mantener speedRef sincronizado ──────────────────────────────────────────
   useEffect(()=>{ speedRef.current=speed; },[speed]);
 
-  // ── Cambio de velocidad en tiempo real (browser TTS) ────────────────────────
-  useEffect(()=>{
-    if(ttsEngine!=='browser') return;
-    if(!window.speechSynthesis?.speaking) return;
-    // Reiniciar desde la posición actual con la nueva velocidad
-    speakFromCharRef.current?.(charIndexRef.current);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[speed, ttsEngine]);
+  // ── Cambio de velocidad: manejador directo (browser) / playbackRate (Gemini) ─
+  const handleSpeedChange=(s)=>{
+    setSpeed(s);
+    if(ttsEngine==='gemini'&&audioRef.current) { audioRef.current.playbackRate=s; return; }
+    if(ttsEngine==='browser'&&window.speechSynthesis?.speaking){
+      speedRef.current=s; // actualizar ref ANTES de reiniciar
+      speakFromCharRef.current?.(charIndexRef.current);
+    }
+  };
 
   // ── Cuenta regresiva 429 → auto-retry ────────────────────────────────────────
   useEffect(()=>{
@@ -871,18 +878,27 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
 
     window.speechSynthesis?.cancel();
     const utt=new SpeechSynthesisUtterance(textToSpeak);
-    // Multiplicar por 0.85 para que "1×" suene natural, no apresurado
-    utt.rate=Math.max(0.3, Math.min(2, speedRef.current * 0.85));
-    utt.lang='es';
+    // 0.85× → "1×" suena pausado y natural; 0.5× mín para no distorsionar
+    utt.rate =Math.max(0.5, Math.min(2, speedRef.current * 0.85));
+    utt.pitch=0.92;   // ligeramente más grave → menos robótico
+    utt.lang ='es';
 
-    // 1) Voz elegida por el usuario en Settings
-    // 2) Mejor voz local en español
-    // 3) Cualquier voz en español
+    // Elegir la mejor voz disponible con sistema de puntuación:
+    // +10 en español, +8 enhanced/premium/neural (en iOS suenan casi humanas),
+    // +6 voz local (evita depender de red), +2 si contiene "es-" exacto
     const voices=browserVoicesRef.current;
-    const chosen  =browserVoice?voices.find(v=>v.voiceURI===browserVoice):null;
-    const esLocal =voices.find(v=>v.lang.startsWith('es')&&v.localService);
-    const esAny   =voices.find(v=>v.lang.startsWith('es'));
-    const bestVoice=chosen||esLocal||esAny;
+    const score=v=>{
+      let s=0;
+      const lang=v.lang.toLowerCase(); const name=v.name.toLowerCase();
+      if(lang.startsWith('es')) s+=10;
+      if(/enhanced|premium|neural|natural|online/.test(name)) s+=8;
+      if(v.localService) s+=6;
+      if(lang==='es'||lang.startsWith('es-')) s+=2;
+      return s;
+    };
+    const chosen=browserVoice?voices.find(v=>v.voiceURI===browserVoice):null;
+    const bestAuto=[...voices].sort((a,b)=>score(b)-score(a))[0];
+    const bestVoice=chosen||bestAuto;
     if(bestVoice) utt.voice=bestVoice;
 
     utt.onstart=()=>setIsPlaying(true);
@@ -1106,7 +1122,7 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
       {/* Speed */}
       <div style={{display:'flex',justifyContent:'center',gap:6}}>
         {SPEEDS.map(s=>(
-          <button key={s} onClick={()=>setSpeed(s)} aria-pressed={speed===s}
+          <button key={s} onClick={()=>handleSpeedChange(s)} aria-pressed={speed===s}
             style={{padding:'5px 11px',borderRadius:20,border:`1.5px solid ${speed===s?'var(--c-accent)':'var(--c-border2)'}`,background:speed===s?'var(--c-accent-bg)':'transparent',color:speed===s?'var(--c-accent-text)':'var(--c-muted)',fontSize:12,fontWeight:700,cursor:'pointer',transition:'all .15s'}}>
             {s}×
           </button>
