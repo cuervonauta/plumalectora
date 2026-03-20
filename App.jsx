@@ -534,7 +534,7 @@ function ToastContainer({toasts}) {
 }
 
 // ─── SETTINGS MODAL ───────────────────────────────────────────────────────────
-function SettingsModal({voice, setVoice, themePref, setThemePref, onClose}) {
+function SettingsModal({voice, setVoice, ttsEngine, setTtsEngine, themePref, setThemePref, onClose}) {
   return (
     <div
       role="dialog" aria-modal="true" aria-label="Preferencias"
@@ -576,9 +576,37 @@ function SettingsModal({voice, setVoice, themePref, setThemePref, onClose}) {
           })}
         </div>
 
-        {/* ── VOZ ── */}
+        {/* ── MOTOR TTS ── */}
         <label style={{display:'block',fontSize:11,fontWeight:700,color:'var(--c-text2)',marginBottom:12,textTransform:'uppercase',letterSpacing:'.08em'}}>
-          Voz narradora
+          Motor de síntesis de voz
+        </label>
+        <div style={{display:'flex',flexDirection:'column',gap:8,marginBottom:28}}>
+          {[
+            {id:'browser', emoji:'⚡', title:'Navegador', sub:'Instantáneo · sin límites · funciona offline'},
+            {id:'gemini',  emoji:'✨', title:'Gemini IA',  sub:'Voz natural · requiere API · puede tener límites'},
+          ].map(e=>{
+            const active=ttsEngine===e.id;
+            return (
+              <button key={e.id} onClick={()=>setTtsEngine(e.id)} aria-pressed={active}
+                style={{textAlign:'left',padding:'13px 15px',borderRadius:13,
+                  border:`2px solid ${active?'var(--c-accent)':'var(--c-border2)'}`,
+                  background:active?'var(--c-accent-bg)':'var(--c-surface2)',
+                  cursor:'pointer',transition:'all .18s'}}>
+                <div style={{display:'flex',alignItems:'center',gap:8}}>
+                  <span style={{fontSize:18}}>{e.emoji}</span>
+                  <span style={{fontWeight:700,color:'var(--c-text)',fontSize:15}}>{e.title}</span>
+                  {active&&<span style={{marginLeft:'auto',fontSize:10,fontWeight:800,color:'var(--c-accent)',background:'var(--c-badge-bg)',padding:'2px 8px',borderRadius:20}}>Activo</span>}
+                </div>
+                <p style={{fontSize:12,color:'var(--c-muted)',marginTop:3,paddingLeft:26}}>{e.sub}</p>
+              </button>
+            );
+          })}
+        </div>
+
+        {/* ── VOZ (solo Gemini) ── */}
+        {ttsEngine==='gemini'&&<>
+        <label style={{display:'block',fontSize:11,fontWeight:700,color:'var(--c-text2)',marginBottom:12,textTransform:'uppercase',letterSpacing:'.08em'}}>
+          Voz narradora (Gemini)
         </label>
         <div style={{display:'flex',flexDirection:'column',gap:8,marginBottom:28}}>
           {VOICES.map(v=>(
@@ -597,6 +625,7 @@ function SettingsModal({voice, setVoice, themePref, setThemePref, onClose}) {
             </button>
           ))}
         </div>
+        </>}
 
         <button onClick={onClose}
           style={{width:'100%',background:'var(--c-btn)',color:'#fff',border:'none',borderRadius:14,padding:'14px',fontSize:16,fontWeight:700,cursor:'pointer',boxShadow:'0 4px 14px var(--c-btn-glow)'}}>
@@ -675,20 +704,33 @@ function UploadScreen({onBook, toast, isParsing, setIsParsing}) {
 }
 
 // ─── PLAYER SCREEN ────────────────────────────────────────────────────────────
-function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCache,chapterStatus,setChapterStatus,voice,toast}) {
-  const audioRef=useRef(null); const abortRef=useRef(null); const rangeRef=useRef(null);
-  const prefetchAbortRef=useRef(null);
-  const genAndPlayRef=useRef(null); // referencia para el countdown auto-retry
-  const [isPlaying,     setIsPlaying]     =useState(false);
-  const [isGen,         setIsGen]         =useState(false);
-  const [currentT,      setCurrentT]      =useState(0);
-  const [duration,      setDuration]      =useState(0);
-  const [speed,         setSpeed]         =useState(1);
-  const [rateLimitSecs, setRateLimitSecs] =useState(0); // cuenta regresiva 429
+function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCache,chapterStatus,setChapterStatus,voice,toast,ttsEngine}) {
+  // ── Refs ────────────────────────────────────────────────────────────────────
+  const audioRef          =useRef(null);
+  const abortRef          =useRef(null);
+  const rangeRef          =useRef(null);
+  const prefetchAbortRef  =useRef(null);
+  const genAndPlayRef     =useRef(null);
+  // Browser TTS refs
+  const utteranceRef      =useRef(null);
+  const charIndexRef      =useRef(0);
+  const browserVoicesRef  =useRef([]);
+  const speedRef          =useRef(1);
+
+  // ── State ───────────────────────────────────────────────────────────────────
+  const [isPlaying,      setIsPlaying]      =useState(false);
+  const [isGen,          setIsGen]          =useState(false);
+  const [currentT,       setCurrentT]       =useState(0);
+  const [duration,       setDuration]       =useState(0);
+  const [speed,          setSpeed]          =useState(1);
+  const [rateLimitSecs,  setRateLimitSecs]  =useState(0);
+  const [browserProg,    setBrowserProg]    =useState(0); // 0–100 para browser TTS
 
   const chapter=book?.chapters[chapterIdx];
-  const isReady=!!chapterCache[chapterIdx];
-  const prog=duration>0?(currentT/duration)*100:0;
+  // Browser TTS: siempre "listo" (no hay fase de generación)
+  const isReady=ttsEngine==='browser'||!!chapterCache[chapterIdx];
+  // Progreso: browser usa posición de carácter; Gemini usa tiempo de audio
+  const prog=ttsEngine==='browser'?browserProg:(duration>0?(currentT/duration)*100:0);
 
   useEffect(()=>{if(audioRef.current)audioRef.current.playbackRate=speed;},[speed]);
   // Cancelar prefetch al desmontar
@@ -710,11 +752,29 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
     const a=audioRef.current; if(!a) return;
     a.pause(); setIsPlaying(false); setCurrentT(0); setDuration(0);
     if(rangeRef.current)rangeRef.current.style.setProperty('--prog','0%');
-    // No llamar a.load() — resetea el elemento y puede cancelar play() posterior
     if(chapterCache[chapterIdx]){a.src=chapterCache[chapterIdx];a.playbackRate=speed;}
     else a.src='';
   // eslint-disable-next-line react-hooks/exhaustive-deps
   },[chapterIdx]);
+
+  // ── Browser TTS: cargar voces disponibles ───────────────────────────────────
+  useEffect(()=>{
+    const load=()=>{ browserVoicesRef.current=window.speechSynthesis?.getVoices()||[]; };
+    load();
+    window.speechSynthesis?.addEventListener('voiceschanged',load);
+    return()=>window.speechSynthesis?.removeEventListener('voiceschanged',load);
+  },[]);
+
+  // ── Browser TTS: cancelar al cambiar capítulo ───────────────────────────────
+  useEffect(()=>{
+    if(ttsEngine==='browser'){
+      window.speechSynthesis?.cancel();
+      setIsPlaying(false); setBrowserProg(0); charIndexRef.current=0;
+    }
+  },[chapterIdx,ttsEngine]);
+
+  // ── Mantener speedRef sincronizado ──────────────────────────────────────────
+  useEffect(()=>{ speedRef.current=speed; },[speed]);
 
   // ── Cuenta regresiva 429 → auto-retry ────────────────────────────────────────
   useEffect(()=>{
@@ -728,6 +788,45 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
     },1000);
     return()=>clearTimeout(t);
   },[rateLimitSecs]);
+
+  // ── Browser TTS: hablar desde un carácter dado ──────────────────────────────
+  const speakFromChar=(fromChar=0)=>{
+    if(!chapter) return;
+    const fullText=chapter.text;
+    const textToSpeak=fromChar>0?fullText.slice(fromChar):fullText;
+    charIndexRef.current=fromChar;
+
+    window.speechSynthesis?.cancel();
+    const utt=new SpeechSynthesisUtterance(textToSpeak);
+    utt.rate=speedRef.current;
+    utt.lang='es';
+
+    // Preferir voz local en español; si no hay, usar la que sea en español
+    const voices=browserVoicesRef.current;
+    const esLocal=voices.find(v=>v.lang.startsWith('es')&&v.localService);
+    const esAny  =voices.find(v=>v.lang.startsWith('es'));
+    if(esLocal||esAny) utt.voice=esLocal||esAny;
+
+    utt.onstart=()=>setIsPlaying(true);
+    utt.onend=()=>{
+      setIsPlaying(false); setBrowserProg(100);
+      // Auto-avanzar al siguiente capítulo
+      setChapterIdx(i=>{ const max=(book?.chapters.length||1)-1; return i<max?i+1:i; });
+    };
+    utt.onboundary=e=>{
+      if(e.name==='word'){
+        const abs=fromChar+e.charIndex; charIndexRef.current=abs;
+        setBrowserProg(fullText.length>0?(abs/fullText.length)*100:0);
+      }
+    };
+    utt.onerror=e=>{
+      if(e.error!=='interrupted'&&e.error!=='canceled') setIsPlaying(false);
+    };
+
+    utteranceRef.current=utt;
+    setBrowserProg(fullText.length>0?(fromChar/fullText.length)*100:0);
+    window.speechSynthesis?.speak(utt);
+  };
 
   const generateAndPlay=async()=>{
     if(!chapter) return;
@@ -765,11 +864,16 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
   genAndPlayRef.current=generateAndPlay;
 
   const togglePlay=async()=>{
+    // ── Browser TTS ──────────────────────────────────────────────────────────
+    if(ttsEngine==='browser'){
+      if(isPlaying){ window.speechSynthesis?.pause(); setIsPlaying(false); return; }
+      if(window.speechSynthesis?.paused){ window.speechSynthesis.resume(); setIsPlaying(true); return; }
+      speakFromChar(charIndexRef.current);
+      return;
+    }
+    // ── Gemini TTS ───────────────────────────────────────────────────────────
     const a=audioRef.current; if(!a) return;
     if(isPlaying){a.pause();return;}
-    // ⚠️ NO usar a.src para detectar si hay audio — en Chrome/Safari, a.src=''
-    // devuelve la URL de la página (truthy), causando play() sobre fuente inválida.
-    // Usar chapterCache como fuente de verdad.
     if(chapterCache[chapterIdx]){
       a.src=chapterCache[chapterIdx]; a.playbackRate=speed;
       a.play().catch(()=>toast('Toca Play nuevamente para reproducir.','error'));
@@ -778,12 +882,24 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
     }
   };
 
-  const skip=d=>{const a=audioRef.current;if(a?.src)a.currentTime=Math.max(0,Math.min(a.duration||0,a.currentTime+d));};
+  const skip=d=>{
+    if(ttsEngine==='browser'){
+      const text=chapter?.text||''; if(!text) return;
+      // ~150 palabras/min × ~5 chars/palabra ÷ 60s = ~12.5 chars/s a velocidad 1×
+      const skipChars=Math.round(12.5*speedRef.current*d);
+      const newPos=Math.max(0,Math.min(text.length-1,charIndexRef.current+skipChars));
+      // Redondear al límite de palabra más cercano
+      const snap=d>0?text.indexOf(' ',newPos):text.lastIndexOf(' ',newPos);
+      speakFromChar(snap>0?snap+1:newPos);
+      return;
+    }
+    const a=audioRef.current;if(a?.src)a.currentTime=Math.max(0,Math.min(a.duration||0,a.currentTime+d));
+  };
   const changeChap=d=>{
+    if(ttsEngine==='browser') window.speechSynthesis?.cancel();
     prefetchAbortRef.current?.abort();
     abortRef.current?.abort();
-    setIsGen(false);
-    setRateLimitSecs(0);
+    setIsGen(false); setRateLimitSecs(0);
     setChapterIdx(i=>i+d);
   };
 
@@ -826,15 +942,23 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
         <p style={{fontSize:10,fontWeight:800,color:'var(--c-accent)',textTransform:'uppercase',letterSpacing:'.12em',marginBottom:6}}>Reproduciendo</p>
         <h2 style={{fontSize:20,fontWeight:800,color:'var(--c-text)',lineHeight:1.3,marginBottom:4}}>{book.title}</h2>
         <p style={{color:'var(--c-muted)',fontSize:13}}>{chapter?.title} · {chapterIdx+1}/{total}</p>
+        <p style={{fontSize:10,color:'var(--c-muted2)',marginTop:2,opacity:.7}}>{ttsEngine==='browser'?'⚡ Navegador':'✨ Gemini IA'}</p>
       </div>
 
       {/* Waveform */}
       <div style={{background:'var(--c-surface)',borderRadius:20,height:100,display:'flex',alignItems:'center',justifyContent:'center',gap:3,padding:'0 16px',overflow:'hidden'}}>
         {isGen?(
+          /* Generando con Gemini — barras animadas de carga */
           Array.from({length:22}).map((_,i)=>(
             <div key={i} style={{width:4,borderRadius:4,background:'var(--c-accent)',animation:`wave .9s ease-in-out infinite`,animationDelay:`${i*.075}s`,height:8}}/>
           ))
-        ):isReady?(
+        ):isPlaying?(
+          /* Reproduciendo (cualquier motor) — barras animadas */
+          Array.from({length:22}).map((_,i)=>(
+            <div key={i} style={{width:4,borderRadius:4,background:'var(--c-accent)',animation:`wave .9s ease-in-out infinite`,animationDelay:`${i*.075}s`,height:`${8+Math.abs(Math.sin(i*.55))*20}px`}}/>
+          ))
+        ):isReady&&prog>0?(
+          /* Pausado con progreso — barras estáticas */
           Array.from({length:22}).map((_,i)=>(
             <div key={i} style={{width:4,borderRadius:4,height:`${10+Math.abs(Math.sin(i*.72+1))*26}px`,background:(i/22)<(prog/100)?'var(--c-accent)':'var(--c-border2)',transition:'background .25s'}}/>
           ))
@@ -846,7 +970,9 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
         ):(
           <div style={{textAlign:'center'}}>
             <div style={{fontSize:36,color:'var(--c-border2)',marginBottom:8}}><Ic.Headphones/></div>
-            <p style={{fontSize:12,color:'var(--c-muted)'}}>Toca ▶ para generar el audio</p>
+            <p style={{fontSize:12,color:'var(--c-muted)'}}>
+              {ttsEngine==='browser'?'Toca ▶ para escuchar':'Toca ▶ para generar el audio'}
+            </p>
           </div>
         )}
       </div>
@@ -854,7 +980,19 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
       {/* Progress */}
       <div>
         <input ref={rangeRef} type="range" min="0" max="100" value={prog}
-          onChange={e=>{const a=audioRef.current;if(!a?.duration)return;const t=(+e.target.value/100)*a.duration;a.currentTime=t;setCurrentT(t);e.target.style.setProperty('--prog',`${e.target.value}%`);}}
+          onChange={e=>{
+            const pct=+e.target.value;
+            e.target.style.setProperty('--prog',`${pct}%`);
+            if(ttsEngine==='browser'){
+              const text=chapter?.text||'';
+              if(!text) return;
+              const charPos=Math.round((pct/100)*text.length);
+              speakFromChar(charPos);
+            } else {
+              const a=audioRef.current;if(!a?.duration)return;
+              const t=(pct/100)*a.duration;a.currentTime=t;setCurrentT(t);
+            }
+          }}
           disabled={!isReady}/>
         <div style={{display:'flex',justifyContent:'space-between',marginTop:4}}>
           <span style={{fontSize:12,color:'var(--c-muted)'}}>{formatTime(currentT)}</span>
@@ -867,9 +1005,18 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
         <button onClick={()=>skip(-15)} style={{background:'none',border:'none',color:'var(--c-text2)',fontSize:28,cursor:'pointer',display:'flex',flexDirection:'column',alignItems:'center',gap:2,transition:'opacity .15s'}}>
           <Ic.Rew/><span style={{fontSize:9,fontWeight:700}}>15s</span>
         </button>
-        <button onClick={togglePlay} disabled={isGen}
-          style={{width:70,height:70,borderRadius:'50%',background:isGen?'var(--c-surface)':'var(--c-btn)',border:'none',color:isGen?'var(--c-accent)':'#fff',fontSize:28,cursor:isGen?'default':'pointer',display:'flex',alignItems:'center',justifyContent:'center',boxShadow:isPlaying?'none':`0 0 24px var(--c-btn-glow)`,animation:isPlaying?'pulse 2s ease-in-out infinite':'none',transition:'background .2s'}}>
-          {isGen?<Spinner size={26} color="var(--c-accent)"/>:isPlaying?<Ic.Pause/>:<Ic.Play/>}
+        <button onClick={togglePlay} disabled={isGen&&ttsEngine==='gemini'}
+          style={{width:70,height:70,borderRadius:'50%',
+            background:(isGen&&ttsEngine==='gemini')?'var(--c-surface)':'var(--c-btn)',
+            border:'none',
+            color:(isGen&&ttsEngine==='gemini')?'var(--c-accent)':'#fff',
+            fontSize:28,
+            cursor:(isGen&&ttsEngine==='gemini')?'default':'pointer',
+            display:'flex',alignItems:'center',justifyContent:'center',
+            boxShadow:isPlaying?'none':`0 0 24px var(--c-btn-glow)`,
+            animation:isPlaying?'pulse 2s ease-in-out infinite':'none',
+            transition:'background .2s'}}>
+          {(isGen&&ttsEngine==='gemini')?<Spinner size={26} color="var(--c-accent)"/>:isPlaying?<Ic.Pause/>:<Ic.Play/>}
         </button>
         <button onClick={()=>skip(15)} style={{background:'none',border:'none',color:'var(--c-text2)',fontSize:28,cursor:'pointer',display:'flex',flexDirection:'column',alignItems:'center',gap:2,transition:'opacity .15s'}}>
           <Ic.Fwd/><span style={{fontSize:9,fontWeight:700}}>15s</span>
@@ -958,6 +1105,7 @@ function ChaptersScreen({book,chapterIdx,setChapterIdx,chapterStatus,setActiveTa
 // ─── APP ROOT ─────────────────────────────────────────────────────────────────
 export default function App() {
   const [voice,         setVoice]         = useLS('ab_voice','Kore');
+  const [ttsEngine,     setTtsEngine]     = useLS('ab_engine','browser'); // 'browser' | 'gemini'
   const [showSettings,  setShowSettings]  = useState(false);
   const [activeTab,     setActiveTab]     = useState('upload');
   const [book,          setBook]          = useState(null);
@@ -1007,7 +1155,7 @@ export default function App() {
       {/* Screens */}
       <main style={{flex:1,display:'flex',flexDirection:'column',overflow:'hidden',animation:'fadeIn .2s ease'}}>
         {activeTab==='upload'   && <UploadScreen onBook={onBook} toast={toast} isParsing={isParsing} setIsParsing={setIsParsing}/>}
-        {activeTab==='player'   && <PlayerScreen book={book} chapterIdx={chapterIdx} setChapterIdx={setChapterIdx} chapterCache={chapterCache} setChapterCache={setChapterCache} chapterStatus={chapterStatus} setChapterStatus={setChapterStatus} voice={voice} toast={toast}/>}
+        {activeTab==='player'   && <PlayerScreen book={book} chapterIdx={chapterIdx} setChapterIdx={setChapterIdx} chapterCache={chapterCache} setChapterCache={setChapterCache} chapterStatus={chapterStatus} setChapterStatus={setChapterStatus} voice={voice} toast={toast} ttsEngine={ttsEngine}/>}
         {activeTab==='chapters' && <ChaptersScreen book={book} chapterIdx={chapterIdx} setChapterIdx={setChapterIdx} chapterStatus={chapterStatus} setActiveTab={setActiveTab}/>}
       </main>
 
@@ -1031,6 +1179,7 @@ export default function App() {
       {showSettings&&(
         <SettingsModal
           voice={voice} setVoice={setVoice}
+          ttsEngine={ttsEngine} setTtsEngine={setTtsEngine}
           themePref={themePref} setThemePref={setThemePref}
           onClose={()=>setShowSettings(false)}
         />
