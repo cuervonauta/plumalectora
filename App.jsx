@@ -168,7 +168,7 @@ const VOICES = [
   { id:'Puck',   label:'Puck',   gender:'Hombre', desc:'Vibrante y expresiva'},
 ];
 const SPEEDS          = [0.75, 1, 1.25, 1.5, 2];
-const WORDS_PER_CHUNK = 800;  // máx por llamada TTS (~5000 chars)
+const WORDS_PER_CHUNK = 400;  // máx por llamada TTS — 400 palabras ≈ 2000 chars, genera rápido
 const PARSE_TIMEOUT   = 60_000;
 const TTS_ENDPOINT    = '/api/tts';
 
@@ -382,11 +382,13 @@ async function parseFile(file) {
 
 // ─── TTS SERVICE ─────────────────────────────────────────────────────────────
 async function generateAudio(text,voice,signal) {
-  const MAX_ATTEMPTS=3;
+  const MAX_ATTEMPTS=4;
+  // Backoff agresivo para respetar el límite de la API: 5s, 15s, 45s
+  const BACKOFF=[5_000, 15_000, 45_000];
   for(let attempt=0;attempt<MAX_ATTEMPTS;attempt++){
     if(signal?.aborted) throw new DOMException('Cancelado','AbortError');
     const tc=new AbortController();
-    const tid=setTimeout(()=>tc.abort(),45_000);
+    const tid=setTimeout(()=>tc.abort(),55_000);
     const sig=(signal&&typeof AbortSignal.any==='function')
       ? AbortSignal.any([signal,tc.signal]) : tc.signal;
     try {
@@ -396,10 +398,9 @@ async function generateAudio(text,voice,signal) {
       });
       clearTimeout(tid);
       if(res.status===429){
-        // Si ya agotamos los reintentos, lanzar error explicito
         if(attempt===MAX_ATTEMPTS-1)
-          throw new Error('Límite de solicitudes alcanzado. Intenta en unos minutos.');
-        const wait=Math.pow(2,attempt)*1000+Math.random()*500;
+          throw new Error('Límite de solicitudes alcanzado. Espera un momento e intenta de nuevo.');
+        const wait=(BACKOFF[attempt]||45_000)+Math.random()*1000;
         await new Promise(r=>setTimeout(r,wait));
         continue;
       }
@@ -411,7 +412,6 @@ async function generateAudio(text,voice,signal) {
     } catch(e){
       clearTimeout(tid);
       if(e.name==='AbortError'){
-        // Distinguir timeout propio vs cancelación del usuario
         if(tc.signal.aborted&&!signal?.aborted)
           throw new Error('Tiempo de espera agotado. Intenta de nuevo.');
         throw e;
@@ -419,7 +419,6 @@ async function generateAudio(text,voice,signal) {
       if(attempt===MAX_ATTEMPTS-1) throw e;
     }
   }
-  // Nunca debería llegar aquí, pero por si acaso:
   throw new Error('No se pudo generar el audio. Intenta de nuevo.');
 }
 
@@ -771,13 +770,13 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
   };
 
   // ── Prefetch silencioso del capítulo siguiente ──────────────────────────────
+  // Espera 25s para no competir con la llamada principal y respetar el rate-limit.
   const startPrefetch=useCallback((nextIdx)=>{
     if(!book?.chapters[nextIdx]) return;
     if(chapterCache[nextIdx]) return; // ya está en caché
     prefetchAbortRef.current?.abort();
     prefetchAbortRef.current=new AbortController();
     const sig=prefetchAbortRef.current.signal;
-    // Esperamos 3s para no competir con la reproducción actual
     setTimeout(async()=>{
       if(sig.aborted) return;
       try{
@@ -787,7 +786,7 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
         setChapterCache(p=>({...p,[nextIdx]:url}));
         setChapterStatus(p=>({...p,[nextIdx]:'ready'}));
       }catch{/* fallo silencioso — el usuario puede generarlo manualmente */}
-    },3000);
+    },25_000);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   },[book,voice]);
 
