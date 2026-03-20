@@ -677,12 +677,14 @@ function UploadScreen({onBook, toast, isParsing, setIsParsing}) {
 // ─── PLAYER SCREEN ────────────────────────────────────────────────────────────
 function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCache,chapterStatus,setChapterStatus,voice,toast}) {
   const audioRef=useRef(null); const abortRef=useRef(null); const rangeRef=useRef(null);
-  const prefetchAbortRef=useRef(null); // para cancelar prefetch si cambia el capítulo
-  const [isPlaying, setIsPlaying]=useState(false);
-  const [isGen,     setIsGen]    =useState(false);
-  const [currentT,  setCurrentT] =useState(0);
-  const [duration,  setDuration] =useState(0);
-  const [speed,     setSpeed]    =useState(1);
+  const prefetchAbortRef=useRef(null);
+  const genAndPlayRef=useRef(null); // referencia para el countdown auto-retry
+  const [isPlaying,     setIsPlaying]     =useState(false);
+  const [isGen,         setIsGen]         =useState(false);
+  const [currentT,      setCurrentT]      =useState(0);
+  const [duration,      setDuration]      =useState(0);
+  const [speed,         setSpeed]         =useState(1);
+  const [rateLimitSecs, setRateLimitSecs] =useState(0); // cuenta regresiva 429
 
   const chapter=book?.chapters[chapterIdx];
   const isReady=!!chapterCache[chapterIdx];
@@ -714,15 +716,26 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
   // eslint-disable-next-line react-hooks/exhaustive-deps
   },[chapterIdx]);
 
+  // ── Cuenta regresiva 429 → auto-retry ────────────────────────────────────────
+  useEffect(()=>{
+    if(rateLimitSecs<=0) return;
+    const t=setTimeout(()=>{
+      setRateLimitSecs(s=>{
+        const next=s-1;
+        if(next<=0) setTimeout(()=>genAndPlayRef.current?.(),0);
+        return next;
+      });
+    },1000);
+    return()=>clearTimeout(t);
+  },[rateLimitSecs]);
+
   const generateAndPlay=async()=>{
     if(!chapter) return;
-    // ── Desbloquear audio DENTRO del gesto del usuario (antes del await) ──
-    // Importante: NO llamar a.load() ni limpiar src — eso cancela el unlock.
+    setRateLimitSecs(0); // cancelar cualquier countdown previo
     const a=audioRef.current;
     const silentUrl=URL.createObjectURL(silentWavBlob());
     a.src=silentUrl;
     try{ const p=a.play(); if(p) await p; a.pause(); }catch{}
-    // Dejamos el elemento desbloqueado; el src se sobreescribe abajo.
 
     abortRef.current?.abort(); abortRef.current=new AbortController();
     setIsGen(true); setChapterStatus(p=>({...p,[chapterIdx]:'generating'}));
@@ -731,21 +744,25 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
       const url=URL.createObjectURL(blob);
       setChapterCache(p=>({...p,[chapterIdx]:url}));
       setChapterStatus(p=>({...p,[chapterIdx]:'ready'}));
-      // Solo cambiar src y reproducir — sin a.load() que cancela el play()
       a.src=url; a.playbackRate=speed;
       a.play().catch(()=>toast('Toca Play nuevamente.','error'));
-      // Prefetch del siguiente capítulo en background
       startPrefetch(chapterIdx+1);
     }catch(e){
       if(e.name==='AbortError') return;
       setChapterStatus(p=>({...p,[chapterIdx]:'error'}));
-      toast(e.message||'Error al generar el audio.','error');
+      // 429 → iniciar cuenta regresiva de 60s y reintentar automáticamente
+      if(e.message?.toLowerCase().includes('límite')||e.message?.toLowerCase().includes('limite')){
+        setRateLimitSecs(60);
+      } else {
+        toast(e.message||'Error al generar el audio.','error');
+      }
     }finally{
       setIsGen(false);
-      // Siempre liberar el blob silencioso, haya éxito o error
       URL.revokeObjectURL(silentUrl);
     }
   };
+  // Mantener ref actualizada para el countdown
+  genAndPlayRef.current=generateAndPlay;
 
   const togglePlay=async()=>{
     const a=audioRef.current; if(!a) return;
@@ -766,6 +783,7 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
     prefetchAbortRef.current?.abort();
     abortRef.current?.abort();
     setIsGen(false);
+    setRateLimitSecs(0);
     setChapterIdx(i=>i+d);
   };
 
@@ -820,6 +838,11 @@ function PlayerScreen({book,chapterIdx,setChapterIdx,chapterCache,setChapterCach
           Array.from({length:22}).map((_,i)=>(
             <div key={i} style={{width:4,borderRadius:4,height:`${10+Math.abs(Math.sin(i*.72+1))*26}px`,background:(i/22)<(prog/100)?'var(--c-accent)':'var(--c-border2)',transition:'background .25s'}}/>
           ))
+        ):rateLimitSecs>0?(
+          <div style={{textAlign:'center'}}>
+            <div style={{fontSize:28,fontWeight:900,color:'var(--c-accent)',marginBottom:6}}>{rateLimitSecs}s</div>
+            <p style={{fontSize:12,color:'var(--c-muted)'}}>Límite de API — reintentando automáticamente…</p>
+          </div>
         ):(
           <div style={{textAlign:'center'}}>
             <div style={{fontSize:36,color:'var(--c-border2)',marginBottom:8}}><Ic.Headphones/></div>
